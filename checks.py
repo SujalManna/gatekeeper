@@ -437,7 +437,24 @@ def company_triage(text, company_names):
     return True, f"title/snippet names \"{named}\" with risk keyword(s) {risk}"
 
 
-def classify_company_hit(text, company_names, window=300):
+# A link to another story ("Related article: ...", "Read more: ...") just before the mention.
+TEASER_BEFORE = re.compile(
+    r"(related (?:article|story|stories|news|reading)|read more|also read|see also|recommended|"
+    r"trending|more from|you may (?:also )?like|top stories|latest news|must read)\s*:?[^.\n]{0,160}$")
+_SENT_END = re.compile(r"(?<=[.!?])\s+(?=[\"'“(]?[A-Z0-9])|\n")
+
+
+def _sentence_window(text, s, e, cap):
+    """Bounds of the sentence containing text[s:e], at most `cap` characters either side."""
+    lo, hi = max(0, s - cap), min(len(text), e + cap)
+    ends = list(_SENT_END.finditer(text, lo, s))
+    a = ends[-1].end() if ends else lo
+    nxt = _SENT_END.search(text, e, hi)
+    b = nxt.start() if nxt else hi
+    return a, b
+
+
+def classify_company_hit(text, company_names, window=150):
     """Is the page accusing THE COMPANY? Only if accusing wording sits next to its name:
     shell/front/dummy firm, set up to route or launder money, its directors/promoters arrested,
     an FIR/case against it, or it being booked/raided. A mention where it is impersonated,
@@ -456,8 +473,15 @@ def classify_company_hit(text, company_names, window=300):
     if not mentions:
         return "not_about_company", f"page does not name the company ({', '.join(company_names)})", None
     best = None
+    teaser_only = True
     for s, e, n, p in sorted(mentions):
-        a, b = max(0, s - window), min(len(text), e + window)
+        # A mention inside a "related article" / "read more" teaser links to another story.
+        if TEASER_BEFORE.search(low[max(0, s - 160):s]):
+            continue
+        teaser_only = False
+        # Accusing wording must sit in the SAME sentence as the name, and close to it: a page
+        # can name the company in one story and accuse someone else in the next.
+        a, b = _sentence_window(text, s, e, window)
         win = low[a:b]
         co = p.pattern
         crime = r"(?:fraud\w*|cheat\w*|defraud\w*|money[- ]launder\w*|forger\w*|scam\w*|embezzl\w*)"
@@ -497,6 +521,9 @@ def classify_company_hit(text, company_names, window=300):
             cand = (1, "no_adverse_content", f"names \"{n}\" but no accusing wording next to it", s, e)
         if best is None or cand[0] > best[0]:
             best = cand
+    if best is None:
+        why = "only in a 'related article' / 'read more' link, not in the story itself" if teaser_only else "nowhere"
+        return "no_adverse_content", f"names the company {why}", None
     _, verdict, reason, s, e = best
     return verdict, reason, passage(text, s, e, radius=260)
 
