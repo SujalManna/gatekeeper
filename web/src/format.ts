@@ -156,6 +156,7 @@ export const HIT_TONE: Record<string, Tone | "muted"> = {
   no_adverse_content: "muted",
   not_about_company: "muted",
   not_read_no_accusation_in_snippet: "muted",
+  social_post_not_evidence: "muted",
   not_relevant: "muted",
 };
 

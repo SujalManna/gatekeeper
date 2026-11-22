@@ -26,6 +26,7 @@ import crust_client as cc
 import dnscheck
 import gdelt
 import store
+import tlscheck
 
 ACTION = "mark_vendor_cleared"
 STEP_ORDER = ["identify", "company_profile", "who_runs_it", "website_check", "operating_signals",
@@ -48,7 +49,7 @@ def new_out():
     return {"data": {}, "checks": [], "red_flags": [], "evidence": [], "unavailable": []}
 
 
-def mark_unavailable(out, what, rec_or_reason, kind="source"):
+def mark_unavailable(out, what, rec_or_reason, kind="source", **extra):
     """A source we could not read (outage, timeout, error status). Never treated as 'no record'.
     kind='adverse_page': an adverse-media article that passed triage but couldn't be read. Such a
     page can only add negative evidence, never clear the vendor (see step_decide)."""
@@ -58,7 +59,7 @@ def mark_unavailable(out, what, rec_or_reason, kind="source"):
         reason = rec_or_reason["unavailable_reason"]
     else:
         reason = f"HTTP {rec_or_reason.get('status_code')}: {json.dumps(rec_or_reason.get('error'))[:200]}"
-    out["unavailable"].append({"source": what, "reason": reason, "kind": kind})
+    out["unavailable"].append({"source": what, "reason": reason, "kind": kind, **extra})
 
 
 def ev(out, source, field, value, retrieved_at, record_date=None):
@@ -527,10 +528,27 @@ def step_website_check(job, website, name, profile):
     s = f"{item.get('url') or url} (via crustdata /web/enrich/live)"
     out["data"].update({"fetched": bool(item.get("success")), "title": title, "text_chars": len(text)})
     if not item.get("success"):
+        # Crustdata answered but the page didn't load: look at the site's certificate ourselves, so a
+        # site nobody maintains any more is reported as that, not as "our source was down".
+        tls = tlscheck.inspect(host) if rec.get("data") is not None and url.startswith("https") else None
+        out["data"]["tls"] = tls
+        if tls and tls["status"] == "expired":
+            when = tls.get("not_after") or "an unknown date"
+            ev(out, f"TLS handshake with {host}:443", "certificate notAfter",
+               f"{when} (issuer {tls.get('issuer') or 'unknown'}; {tls.get('problem')})", tls["checked_at"])
+            flag(out, "website_certificate_expired", "warning",
+                 f"{host}'s security certificate expired on {when}, so the site no longer loads; "
+                 "a site nobody renews is usually not being run (not proof of a front on its own)")
+            check(out, "website_fetch", "failed", f"{host} does not load: its certificate expired on {when}")
+            out["data"].update({"fetched": False, "cert_expired": when, "verified": False})
+            return out
         if dns["status"] == "unavailable":
             mark_unavailable(out, f"DNS lookup for {host}", dns["reason"])
-        mark_unavailable(out, f"vendor website {url}",
-                         rec if rec.get("data") is None else "page fetch returned success=false (also tried human_mode)")
+        reason = "the page did not load (also tried a browser-like fetch)"
+        if tls and tls["status"] == "invalid":
+            reason += f"; its HTTPS certificate is not valid ({tls.get('problem')})"
+        mark_unavailable(out, f"vendor website {url}", rec if rec.get("data") is None else reason,
+                         url=url, label="Vendor website")
         check(out, "website_fetch", "unclear", f"could not fetch {url}; unavailable, not proof the site is missing")
         out["data"]["verified"] = False
         return out
@@ -697,9 +715,10 @@ def _screen_person(job, person, company_names, domain):
     to_read = to_read[:MAX_READ_PER_PERSON]
 
     # 3. Read the hits that passed triage.
-    pages = _read_pages([h["url"] for h in to_read], job, out)
+    pages = _read_pages([h["url"] for h in to_read], job, out, {h["url"]: h["title"] for h in to_read})
     for h in to_read:
         it, fat = pages.get(h["url"], (None, None))
+        _resolved(h, it)
         text = ""
         if it and it.get("success"):
             text, _ = checks.html_to_text(it.get("content") or "")
@@ -720,7 +739,8 @@ def _screen_person(job, person, company_names, domain):
         else:
             complete = False
             mark_unavailable(out, f"adverse-media page {h['url']}",
-                             "passed triage but could not be read (bot check or fetch failure)", "adverse_page")
+                             "passed triage but could not be read (bot check or fetch failure)", "adverse_page",
+                             url=h["url"], title=h.get("title"), about=name)
             h.update({"verdict": "unreviewed", "basis": "title/snippet only",
                       "passage": checks.norm_space(f"{h['title'] or ''} — {h.get('snippet') or ''}"),
                       "reason": "passed triage (" + h["triage"] + ") but the page could not be read, or the "
@@ -729,12 +749,14 @@ def _screen_person(job, person, company_names, domain):
         complete = False
         h.update({"verdict": "unreviewed", "basis": "title/snippet only", "passage": h["triage"],
                   "reason": f"passed triage but over the {MAX_READ_PER_PERSON}-page reading cap; not cleared"})
-        mark_unavailable(out, f"adverse-media page {h['url']}", "over the reading cap", "adverse_page")
+        mark_unavailable(out, f"adverse-media page {h['url']}", "over the reading cap", "adverse_page",
+                         url=h["url"], title=h.get("title"), about=name)
 
     # 4. Record every hit with its evidence.
     for h in hits:
         out["data"]["hits"].append({k: h.get(k) for k in ("person", "source", "url", "title", "record_date",
-                                                           "verdict", "reason", "basis", "passage")})
+                                                           "verdict", "reason", "basis", "passage", "google_link")
+                                    if k != "google_link" or h.get(k)})
         if h.get("passage"):
             where = h.get("evidence_source") or (
                 f"{h['url']} (via crustdata /web/enrich/live)" if h["basis"] == "page" else h["found_via"])
@@ -759,6 +781,12 @@ MAX_READ_PER_PERSON = 10
 ADVERSE_QUERY_TERMS = ["fraud", "arrested", "scam", "lawsuit", '"shell company"']
 COMPANY_QUERY_TERMS = ["fraud", "arrested", "scam", '"shell company"', "cheating", "booked", '"money laundering"']
 MAX_READ_PER_COMPANY = 10
+
+
+def _resolved(h, it):
+    """A Google redirect link read through its publisher's own URL: cite the real article."""
+    if it and it.get("resolved_url"):
+        h["google_link"], h["url"] = h["url"], it["resolved_url"]
 
 
 def _query_name(name):
@@ -866,7 +894,8 @@ def step_company_adverse_media(job, company_names, domain):
         snip = checks.norm_space(f"{h['title'] or ''} — {h.get('snippet') or ''}")
         if h["snippet_verdict"] in ("adverse", "possible_adverse"):
             d["complete"] = False
-            mark_unavailable(out, f"company adverse-media page {h['url']}", why_unread, "adverse_page")
+            mark_unavailable(out, f"company adverse-media page {h['url']}", why_unread, "adverse_page",
+                             url=h["url"], title=h.get("title"), about="the company")
             h.update({"verdict": "unreviewed", "basis": "title/snippet only", "passage": snip,
                       "reason": f"{why_unread}; the snippet itself accuses the company ({h['snippet_reason']}), "
                                 "so it is not cleared"})
@@ -876,9 +905,10 @@ def step_company_adverse_media(job, company_names, domain):
                       "reason": f"{why_unread}; its title/snippet shows no accusation of the company "
                                 f"({h['snippet_reason']}), so it does not block"})
 
-    pages = _read_pages([h["url"] for h in to_read], job, out)
+    pages = _read_pages([h["url"] for h in to_read], job, out, {h["url"]: h["title"] for h in to_read})
     for h in to_read:
         it, fat = pages.get(h["url"], (None, None))
+        _resolved(h, it)
         text = ""
         if it and it.get("success"):
             text, _ = checks.html_to_text(it.get("content") or "")
@@ -887,14 +917,31 @@ def step_company_adverse_media(job, company_names, domain):
         full = ((it or {}).get("title") or "") + "\n" + text
         if text and not any(p.search(full) for _, p in checks._company_patterns(company_names)):
             text = ""  # the page we got doesn't show the company the search saw: not actually read
+        social = checks.is_social(h["url"], (it or {}).get("title"), h["title"])
         if text:
             verdict, reason, psg = checks.classify_company_hit(full, company_names)
+            if social and verdict in ("adverse", "possible_adverse"):
+                # A social page carries replies from anyone: an anonymous post is not evidence.
+                verdict, reason = "social_post_not_evidence", (
+                    f"social-media page; the accusing words ({reason}) are in a post or reply by an "
+                    "unverified account, not in a news report, so it is listed for a human and does not count")
             h.update({"verdict": verdict, "reason": reason, "basis": "page", "passage": psg,
                       "page_title": it.get("title"), "read_at": fat})
+        elif social and h["snippet_verdict"] in ("adverse", "possible_adverse"):
+            h.update({"verdict": "social_post_not_evidence", "basis": "title/snippet only",
+                      "passage": checks.norm_space(f"{h['title'] or ''} — {h.get('snippet') or ''}"),
+                      "reason": "social-media page we couldn't read; its snippet mentions an accusation "
+                                f"({h['snippet_reason']}), but a social post is not evidence, so it does not count"})
         else:
             judge_unread(h, "passed triage but the page could not be read (bot check, login wall or fetch failure)")
     for h in overflow:
         judge_unread(h, f"passed triage but over the {MAX_READ_PER_COMPANY}-page reading cap")
+    social_notes = [h for h in to_read if h.get("verdict") == "social_post_not_evidence"]
+    if social_notes:
+        flag(out, "company_social_mentions", "note",
+             f"{len(social_notes)} social-media page(s) mention accusations against the company in posts or "
+             "replies by unverified accounts; not counted as evidence, listed for a human to look at. URLs: "
+             + " ".join(h["url"] for h in social_notes))
     unread_ok = [h for h in to_read + overflow if h.get("verdict") == "not_read_no_accusation_in_snippet"]
     if unread_ok:
         flag(out, "company_pages_not_read", "note",
@@ -904,7 +951,8 @@ def step_company_adverse_media(job, company_names, domain):
 
     for h in hits:
         d["hits"].append({k: h.get(k) for k in ("source", "url", "title", "page_title", "record_date",
-                                               "verdict", "reason", "basis", "passage")})
+                                               "verdict", "reason", "basis", "passage", "google_link")
+                          if k != "google_link" or h.get(k)})
         if h.get("passage"):
             where = (f"{h['url']} (page title: {h.get('page_title')!r}, via crustdata /web/enrich/live)"
                      if h["basis"] == "page" else h["found_via"])
@@ -976,7 +1024,7 @@ def _judge_social_wall(job, h, person, company_names, out):
         res.sort(key=lambda r: (int(r.get("position") or 99), r["url"]))
         ev(out, s, f"count(non-social results) for \"{ph}\" (copy of {h['url']})", len(res), rec["retrieved_at"])
         cand = res[:3]
-        pages = _read_pages([r["url"] for r in cand], job, out)
+        pages = _read_pages([r["url"] for r in cand], job, out, {r["url"]: r.get("title") for r in cand})
         for r in cand:
             it, fat = pages.get(r["url"], (None, None))
             if not (it and it.get("success")):
@@ -986,9 +1034,10 @@ def _judge_social_wall(job, h, person, company_names, out):
             if checks.is_interstitial(it.get("title"), text) or not checks.name_positions(full, name):
                 continue
             verdict, reason, psg = checks.classify_hit(full, person, company_names)
+            ru = it.get("resolved_url") or r["url"]
             h.update({"verdict": verdict, "basis": "readable copy", "passage": psg, "read_at": fat,
-                      "reason": f"login wall; judged from a readable copy of the story at {r['url']}: {reason}",
-                      "evidence_source": f"{r['url']} (readable copy of {h['url']}, via crustdata /web/enrich/live)"})
+                      "reason": f"login wall; judged from a readable copy of the story at {ru}: {reason}",
+                      "evidence_source": f"{ru} (readable copy of {h['url']}, via crustdata /web/enrich/live)"})
             return True
 
     snip = checks.norm_space(f"{h['title'] or ''} — {h.get('snippet') or ''}")
@@ -1020,8 +1069,41 @@ def _adverse_hits_crustdata(job, name, out):
              "found_at": rec["retrieved_at"]} for r in res], "Crustdata web search (GDELT unavailable)"
 
 
-def _read_pages(urls, job, out):
-    """Fetch pages; google.com/goto redirects and failed direct pages go through human_mode."""
+MAX_LINK_LOOKUPS_PER_RUN = 6   # headline searches for Google redirect links we couldn't open
+_LOOKUPS = {"used": 0}
+
+
+def _find_direct_copy(url, title, job, out):
+    """A google.com/goto link we couldn't open: its real address is encrypted, so search the exact
+    headline and return the same article's own URL on the publisher's site (or None)."""
+    phrase = checks.headline_core(title)
+    if not phrase:
+        return None
+    with _HUMAN_LOCK:
+        if _LOOKUPS["used"] >= MAX_LINK_LOOKUPS_PER_RUN:
+            return None
+        _LOOKUPS["used"] += 1
+    # News search, headline unquoted: Crustdata's news source returns the publisher's own URL, while
+    # its web source mostly returns more Google redirect links.
+    body = {"query": " ".join(re.sub(r"[^\w\s]", " ", phrase).split()), "sources": ["news"]}
+    rec = api("/web/search/live", body, job)
+    if rec.get("data") is None:
+        return None
+    res = [r for r in ((rec["data"] or {}).get("results") or []) if r.get("url")]
+    res.sort(key=lambda r: (int(r.get("position") or 99), r["url"]))
+    for r in res:
+        if "google." in checks.domain_of(r["url"]) or not checks.same_headline(title, r.get("title")):
+            continue
+        ev(out, src("/web/search/live", body), f"direct link for Google result \"{phrase}\"", r["url"],
+           rec["retrieved_at"])
+        return r["url"]
+    return None
+
+
+def _read_pages(urls, job, out, titles=None):
+    """Fetch pages; google.com/goto redirects and failed direct pages go through human_mode. A Google
+    link that still can't be opened is looked up by its headline and read from the publisher directly
+    (the item then carries 'resolved_url')."""
     pages = {}
     redirect = [u for u in urls if "google.com/goto" in u]
     direct = [u for u in urls if u not in redirect]
@@ -1047,6 +1129,19 @@ def _read_pages(urls, job, out):
         for u, it in zip(chunk, items):
             if it.get("success"):
                 pages[u] = (it, frec.get("retrieved_at"))
+
+    stuck = [u for u in redirect if unread(u) and (titles or {}).get(u)]
+    if stuck:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            found = list(pool.map(lambda u: (u, _find_direct_copy(u, titles[u], job, out)), stuck))
+        found = [(u, d) for u, d in found if d]
+        if found:
+            copies = _read_pages([d for _, d in found], job, out)  # direct URLs: no further lookups
+            for u, d in found:
+                # Keep the publisher's URL even if that page is blocked too: the hit then cites the
+                # real article instead of an encrypted Google link (callers still check it was read).
+                it, at = copies.get(d, (None, None))
+                pages[u] = ({**(it or {"success": False, "url": d}), "resolved_url": d}, at)
     return pages
 
 
@@ -1226,6 +1321,42 @@ def step_entity_resolution(outs, name, domain):
 
 
 # ---------- step: decide ----------
+def _url_of(u):
+    m = re.search(r"https?://\S+", u.get("source") or "")
+    return u.get("url") or (m.group() if m else None)
+
+
+def describe_unavailable(u):
+    """One readable line for something we couldn't read: headline and site for news pages,
+    never a raw 300-character Google link."""
+    reason = u.get("reason") or ""
+    if u.get("kind") == "adverse_page":
+        why = ("over the reading cap" if "reading cap" in reason
+               else "couldn't be opened (bot check, login wall or fetch failure)")
+        site = checks.site_name(_url_of(u))
+        if u.get("title"):
+            return f"news article not read: “{checks.norm_space(u['title'])}” ({site or 'Google link'}) — {why}"
+        where = site or ("a Google link" if "google." in (u.get("source") or "") else u.get("source"))
+        return f"news article not read: {where} — {why}"
+    src_ = re.sub(r"https?://(?:www\.)?google\.[^\s]*goto\?\S+", "a Google link", u.get("source") or "")
+    return f"source unavailable: {src_} ({reason})"
+
+
+def missing_items(unavailable, failed_checks):
+    """The 'what's missing' list in a shape the web app can group: unread news pages together."""
+    items = []
+    for u in unavailable:
+        if u.get("kind") == "adverse_page":
+            items.append({"group": "news", "title": u.get("title"), "site": checks.site_name(_url_of(u)),
+                          "url": _url_of(u), "about": u.get("about"),
+                          "why": "over the reading cap" if "reading cap" in (u.get("reason") or "")
+                                 else "couldn't be opened (bot check, login wall or fetch failure)"})
+        else:
+            items.append({"group": "source", "text": describe_unavailable(u)})
+    items += [{"group": "check", "text": t} for t in failed_checks]
+    return items
+
+
 def step_decide(outs):
     ident, prof, ppl, web, ops, er, adv, cadv = (outs[k] for k in (
         "identify", "company_profile", "who_runs_it", "website_check", "operating_signals",
@@ -1252,7 +1383,9 @@ def step_decide(outs):
         "entity_resolution": f"entity link is {er['data'].get('status')} (match_confidence {er['data'].get('match_confidence')})",
         "company_profile": "no active Crustdata profile with a founding year",
         "people": "no founder/CEO/director confirmed as currently at the company",
-        "website": "website does not clearly name the company, list contact details and describe the business",
+        "website": (f"the vendor's website doesn't load: its security certificate expired on {web['data']['cert_expired']}"
+                    if web["data"].get("cert_expired") else
+                    "website does not clearly name the company, list contact details and describe the business"),
         "operating_signals": "fewer than 2 operating signals (employees, recent job postings, operations on the site); "
                              "active status alone does not prove trading",
         "adverse_media_clear": "adverse media not cleared (a hit that passed triage needs human review or "
@@ -1260,8 +1393,9 @@ def step_decide(outs):
         "company_adverse_clear": "company-level adverse media not cleared (an article accuses the company, "
                                  "or a hit that passed triage couldn't be read)",
     }
-    missing = [f"source unavailable: {u['source']} ({u['reason']})" for u in unavailable]
-    missing += [why[k] for k, v in ok.items() if not v]
+    failed = [why[k] for k, v in ok.items() if not v]
+    missing = [describe_unavailable(u) for u in unavailable] + failed
+    items = missing_items(unavailable, failed)
     # Unread adverse-media pages can only add negative evidence; they can't clear a vendor. So they
     # never stop a LOOKS_OFF that a page we DID read already confirms. Any other unavailable source
     # (identity, profile, website, DNS, search) could exonerate, so it still forces CANNOT_VERIFY.
@@ -1276,12 +1410,12 @@ def step_decide(outs):
         verdict, basis = "CANNOT_VERIFY", "entity signals conflict, so no company is picked"
     elif concrete:
         verdict, basis = "LOOKS_OFF", "concrete negative evidence: " + "; ".join(f["flag"] for f in concrete)
-        missing = []
+        missing, items = [], []
     elif all(ok.values()):
-        verdict, basis, missing = "REAL_AND_TRADING", "every check verified", []
+        verdict, basis, missing, items = "REAL_AND_TRADING", "every check verified", [], []
     else:
         verdict, basis = "CANNOT_VERIFY", "not every check could be verified"
-    return {"data": {"verdict": verdict, "basis": basis, "criteria": ok, "missing": missing,
+    return {"data": {"verdict": verdict, "basis": basis, "criteria": ok, "missing": missing, "missing_items": items,
                      "concrete_red_flags": concrete},
             "checks": [], "red_flags": [], "evidence": [], "unavailable": []}
 
@@ -1403,10 +1537,12 @@ def main():
     unavailable = [u for o in outs.values() for u in o.get("unavailable", [])]
     if dec:
         verdict, missing = dec["verdict"], dec["missing"]
+        items = dec.get("missing_items") or [{"group": "check", "text": m} for m in missing]
     else:
         verdict = "CANNOT_VERIFY"
-        missing = [f"run stopped early: {stopped}; re-run the same command to resume"]
-        missing += [f"source unavailable: {u['source']} ({u['reason']})" for u in unavailable]
+        stop = f"run stopped early: {stopped}; re-run the same command to resume"
+        missing = [stop] + [describe_unavailable(u) for u in unavailable]
+        items = [{"group": "check", "text": stop}] + missing_items(unavailable, [])
 
     evidence = [e for o in outs.values() for e in o.get("evidence", [])]
     store.clear_evidence(job)
@@ -1421,6 +1557,7 @@ def main():
         "verdict_basis": (dec or {}).get("basis", "run stopped early"),
         "summary": build_summary(outs, verdict, missing),
         "missing": missing,
+        "missing_items": items,
         "entity_resolution": outs.get("entity_resolution", {}).get("data"),
         "operating_signals": outs.get("operating_signals", {}).get("data"),
         "checks": [c for o in outs.values() for c in o.get("checks", [])],

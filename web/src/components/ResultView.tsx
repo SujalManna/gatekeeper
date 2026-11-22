@@ -3,7 +3,7 @@ import {
   cr, firstUrl, headline, hostOf, HIT_TONE, humanize, inr, leadersOf, matchOf, operatingOf,
   severityTone, show, sourceLabel, STEP_TITLE, VERDICT, when,
 } from "../format";
-import type { AppConfig, CheckResult, MediaHit } from "../types";
+import type { AppConfig, CheckResult, MediaHit, MissingItem } from "../types";
 import ApprovalPanel from "./ApprovalPanel";
 import { VerdictIcon } from "./Icons";
 
@@ -70,12 +70,7 @@ export default function ResultView({
 
       {r.verdict === "LOOKS_OFF" && accusing.length > 0 && <WhyLooksOff hits={accusing} />}
 
-      {r.verdict === "CANNOT_VERIFY" && r.missing && r.missing.length > 0 && (
-        <section className="card missing rise-3" aria-label="What's missing">
-          <h2 style={{ fontSize: 18 }}>What's missing for a clean answer</h2>
-          <ul>{r.missing.map((m) => <li key={m}>{m}</li>)}</ul>
-        </section>
-      )}
+      {r.verdict === "CANNOT_VERIFY" && r.missing && r.missing.length > 0 && <Missing r={r} />}
 
       <section className="facts rise-3" aria-label="Key facts">
         <Fact k="Age" v={ageValue} s={ageNote ? ageNote.replace(/\)$/, "").replace(/^founded/, "Founded") : undefined} />
@@ -124,6 +119,50 @@ export default function ResultView({
         {config.inr_per_usd_note ? ` (${config.inr_per_usd_note})` : ""}
       </p>
     </div>
+  );
+}
+
+const GOOGLE_LINK = /https?:\/\/(?:www\.)?google\.[^\s]*goto\?\S+/g;
+
+/** Older results only have plain strings: keep them, but never show a raw Google redirect link. */
+function itemsOf(r: CheckResult): MissingItem[] {
+  if (r.missing_items && r.missing_items.length) return r.missing_items;
+  return (r.missing ?? []).map((m) => ({ group: "check" as const, text: m.replace(GOOGLE_LINK, "a Google link") }));
+}
+
+/** "What's missing": sources and checks first, then unread news grouped into one item. */
+function Missing({ r }: { r: CheckResult }) {
+  const items = itemsOf(r);
+  const news = items.filter((i) => i.group === "news");
+  const rest = items.filter((i) => i.group !== "news");
+  return (
+    <section className="card missing rise-3" aria-label="What's missing">
+      <h2 style={{ fontSize: 18 }}>What's missing for a clean answer</h2>
+      <ul>
+        {rest.map((m, i) => <li key={i}>{m.text}</li>)}
+        {news.length > 0 && (
+          <li>
+            {news.length === 1 ? "1 news article" : `${news.length} news articles`} that may matter couldn't be read, so
+            they can't be cleared:
+            <ul className="missing-news">
+              {news.map((n, i) => (
+                <li key={i}>
+                  <span className="headline">{n.title ? `“${n.title}”` : "Untitled result"}</span>{" "}
+                  {n.url ? (
+                    <a href={n.url} target="_blank" rel="noreferrer noopener">{n.site ?? "Google link"}</a>
+                  ) : (
+                    <span className="muted">{n.site ?? "unknown site"}</span>
+                  )}
+                  <span className="muted small">
+                    {" "}· {n.about ? `about ${n.about} · ` : ""}{n.why}
+                  </span>
+                </li>
+              ))}
+            </ul>
+          </li>
+        )}
+      </ul>
+    </section>
   );
 }
 

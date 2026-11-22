@@ -51,11 +51,12 @@ The answer is printed and saved to `output/<job_id>.json`:
    source we actually read. Examples: an article accusing the company of fraud, money laundering or
    being a shell, or its directors arrested or charged; a lookalike of a real company's domain;
    a parked site. Active on paper with no operating signals is only a warning (`possible_front`).
+   Posts and replies on social media are listed for a human but never count as evidence.
 4. **Unavailable sources mean `CANNOT_VERIFY`.** A timeout or outage is never read as "nothing
    found" and never produces `LOOKS_OFF`. A domain that doesn't exist (NXDOMAIN) is different: it's a
    definite "no record".
 
-The test suite (`tests/cases.json`, 76 cases) encodes this:
+The test suite (`tests/cases.json`, 97 cases) encodes this:
 
 | Case | Verdict |
 |---|---|
@@ -168,7 +169,7 @@ cd web; npm install; npm run dev
 python run_tests.py
 ```
 
-Expected: `69/69 passed`.
+Expected: `90/90 passed`.
 
 **2. Live end-to-end vendor cases (uses Crustdata credits; cached runs cost almost nothing).**
 
@@ -176,7 +177,7 @@ Expected: `69/69 passed`.
 python run_tests.py --e2e --recheck
 ```
 
-Expected: `76/76 passed`, with each case's runtime and credits printed. The expected verdicts:
+Expected: `97/97 passed`, with each case's runtime and credits printed. The expected verdicts:
 
 | Case | Verdict |
 |---|---|
@@ -210,6 +211,15 @@ Use `-k <text>` to run only the cases whose ID contains that text.
 - **Speed.** Independent steps, the leaders' screenings and page fetches run in parallel (3 workers,
   within rate limits). `human_mode` fetches are capped at 8 per run. Cold runs on new vendors
   took 56–119 s against a 180 s limit; cached re-checks take 1–21 s.
+- **Dead sites vs unavailable sites.** When a vendor's site won't load, `tlscheck.py` looks at its
+  HTTPS certificate. An expired certificate is reported as a finding with its date ("the site is
+  no longer maintained"); any other failure stays "unavailable", never a negative.
+- **Google redirect links.** Web search sometimes returns `google.com/goto` links whose real
+  address is encrypted. When one can't be opened, its headline is looked up in Crustdata's news
+  search to find the article on the publisher's own site (at most 6 lookups per run). Block pages
+  (Cloudflare, CloudFront) count as not read and are never cached.
+- **Readable gaps.** "What's missing" names each unread article by headline and site, grouped,
+  instead of raw links (`missing_items` in the output).
 - **Cost ledger** (`ledger` table). Every call is logged with what Crustdata actually charged, from
   the `X-Credits-Used` response header (the config estimate is used only if the header is missing).
 - **Budget stop.** Before each paid call, the estimate is checked against the per-run budget. Going

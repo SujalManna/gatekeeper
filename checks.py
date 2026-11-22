@@ -194,13 +194,16 @@ def same_site_links(base_url, links, max_pages=3):
 
 INTERSTITIAL = ["verifying your request", "checking your browser", "just a moment", "attention required",
                 "enable javascript and cookies to continue", "access denied", "are you a robot",
-                "unusual traffic from your computer"]
+                "unusual traffic from your computer", "the request could not be satisfied",
+                "request blocked", "error 403", "403 forbidden"]
 
 
 def is_interstitial(title, text):
     """A bot-check / redirect page instead of the real one. Its content says nothing about the target."""
     t, low = (title or "").strip().lower(), (text or "")[:1500].lower()
-    if t in ("google", "just a moment...", "attention required! | cloudflare", "access denied"):
+    if t in ("google", "just a moment...", "attention required! | cloudflare", "access denied", "403 forbidden"):
+        return True
+    if t.startswith("error: the request could not be satisfied"):  # CloudFront block page
         return True
     return len(text or "") < 1500 and any(p in low for p in INTERSTITIAL)
 
@@ -389,6 +392,47 @@ def copy_search_phrases(title, snippet, max_words=12):
     sent = re.sub(r"^[A-Z][a-z]{2,8} \d{1,2},? \d{4}\s*[—-]\s*", "", sent)
     second = " ".join(sent.split()[:max_words])
     return [p for i, p in enumerate([first, second]) if len(p.split()) >= 4 and p not in [first, second][:i]]
+
+
+def headline_core(title, min_words=5, max_words=20):
+    """The searchable part of a result title: no trailing ' | Site' / ' - Site', no '...', no
+    leading section tag ('Anti-EC protest | ...'). None when it's too short or generic to look up,
+    or is itself a URL (Google shows 'http://site/path...' for pages it has no title for)."""
+    t = norm_space(title or "")
+    if not t or re.match(r"(https?://|www\.)", t, re.I):
+        return None
+    t = re.sub(r"\s*(\.\.\.|…)\s*$", "", t)
+    parts = [p.strip() for p in re.split(r"\s+[|–—-]\s+", t) if p.strip()]
+    t = max(parts, key=lambda p: len(p.split())) if parts else t  # the headline is the longest part
+    t = norm_space(re.sub(r"[\"“”‘’'�]", "", t))
+    words = t.split()
+    if len(words) < min_words:
+        return None
+    return " ".join(words[:max_words])
+
+
+def _headline_key(title):
+    t = headline_core(title, min_words=1, max_words=40) or ""
+    return " ".join(re.sub(r"[^\w\s]", " ", t.lower()).split())
+
+
+def same_headline(a, b):
+    """Is result title b the same story as title a? Google truncates titles, so the shorter one
+    only has to match the start of the longer one."""
+    ka, kb = _headline_key(a), _headline_key(b)
+    if min(len(ka.split()), len(kb.split())) < 5:
+        return False
+    if fuzz.ratio(ka, kb) >= 90:          # the same title, give or take quotes and punctuation
+        return True
+    short, long_ = sorted((ka.split(), kb.split()), key=len)
+    n = len(short) - 1                      # the last word of a truncated title may be cut off
+    return n >= 8 and long_[:n] == short[:n]
+
+
+def site_name(url):
+    """'https://www.indianexpress.com/article/...' -> 'indianexpress.com'; Google links -> None."""
+    d = domain_of(url or "")
+    return None if not d or d.startswith("google.") else d
 
 
 # ---------- company-level adverse media ----------

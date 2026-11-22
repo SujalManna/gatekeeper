@@ -256,6 +256,9 @@ md-icon { --md-icon-size: 20px; }
 .why .title { font-family: var(--display); font-size: 20px; font-weight: 600; line-height: 1.3; color: var(--ink); text-decoration: none; }
 .missing { padding: 20px 22px; border-color: #f3ddb5; background: #fffaf2; }
 .missing ul { margin: 8px 0 0; padding-left: 20px; line-height: 1.7; }
+.missing li { overflow-wrap: anywhere; }
+.missing-news { margin-top: 6px !important; display: flex; flex-direction: column; gap: 6px; }
+.missing-news .headline { font-weight: 600; }
 .tabs-card { overflow: hidden; }
 .tablist { display: flex; flex-wrap: wrap; gap: 4px; padding: 8px 12px 0; border-bottom: 1px solid var(--line); }
 .tab { display: inline-flex; align-items: center; gap: 8px; min-height: 46px; padding: 0 14px; border: none; background: none; cursor: pointer; font-weight: 600; font-size: 14px; color: var(--faint); border-bottom: 2px solid transparent; }

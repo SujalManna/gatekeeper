@@ -51,6 +51,16 @@ export interface DegradedSource {
   reason?: string | null;
 }
 
+export interface MissingItem {
+  group: "news" | "source" | "check";
+  text?: string;
+  title?: string | null;
+  site?: string | null;
+  url?: string | null;
+  about?: string | null;
+  why?: string;
+}
+
 export interface CheckResult {
   job_id: string;
   input: { name: string; website: string };
@@ -58,6 +68,7 @@ export interface CheckResult {
   verdict_basis?: string;
   summary: Record<string, string | null | undefined>;
   missing?: string[];
+  missing_items?: MissingItem[];
   checks: CheckRow[];
   red_flags: RedFlag[];
   adverse_media: MediaHit[];

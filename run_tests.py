@@ -40,7 +40,7 @@ def _decide_case(a):
         "identify": out(checks_=[{"check": "identify", "status": "verified"}]),
         "company_profile": out({"verified": True}),
         "who_runs_it": out({"verified": True, "people": [{"name": "x"}]}),
-        "website_check": out({"verified": True}),
+        "website_check": out(a.get("website_data", {"verified": True}), flags=a.get("website_flags", [])),
         "operating_signals": out({"verified": a.get("ops_verified", True)}),
         "entity_resolution": out({"status": a.get("er_status", "linked"), "match_confidence": 1.0}),
         "adverse_media": out({"complete": True, "leaders_screened": 1, "hits": hits},
@@ -48,7 +48,48 @@ def _decide_case(a):
         "company_adverse_media": out({"complete": a.get("company_complete", True),
                                       "hits": [{"verdict": v} for v in a.get("company_hits", [])]}),
     }
+    if a.get("return_missing"):
+        return run.step_decide(outs)["data"]
     return run.step_decide(outs)["data"]["verdict"]
+
+
+def _website_cert_case(a):
+    """step_website_check when Crustdata answers but the page won't load, with a given certificate."""
+    import dnscheck, tlscheck
+    saved = run._fetch, dnscheck.lookup, tlscheck.inspect
+    try:
+        run._fetch = lambda urls, job, human=False: ({"data": [], "retrieved_at": "2026-11-22T00:00:00+00:00"},
+                                                    {}, [{"success": False, "url": u} for u in urls])
+        dnscheck.lookup = lambda host, job: {"status": "exists", "host": host, "resolver": "test", "rcode": 0,
+                                             "retrieved_at": "2026-11-22T00:00:00+00:00"}
+        tlscheck.inspect = lambda host: {"host": host, "checked_at": "2026-11-22T00:00:00+00:00", **a["tls"]}
+        return run.step_website_check("unit-test", a["website"], a["name"], {})
+    finally:
+        run._fetch, dnscheck.lookup, tlscheck.inspect = saved
+
+
+def _google_link_case(a):
+    """_read_pages on a Google redirect link that won't open: found again by headline, read directly."""
+    saved = run._fetch, run.api, dict(run._LOOKUPS)
+    goto = "https://www.google.com/goto?url=CAESabc&gsessionid=x"
+
+    def fake_fetch(urls, job, human=False):
+        items = [{"success": u == a["direct_url"], "url": u, "title": a["direct_title"],
+                  "content": "<p>" + a["page_text"] + "</p>"} for u in urls]
+        return {"data": items, "retrieved_at": "2026-11-22T00:00:00+00:00"}, {}, items
+
+    def fake_api(endpoint, body, job):
+        return {"data": {"results": a["search_results"]}, "retrieved_at": "2026-11-22T00:00:00+00:00"}
+    try:
+        run._fetch, run.api = fake_fetch, fake_api
+        run._LOOKUPS["used"] = 0
+        out = run.new_out()
+        pages = run._read_pages([goto], "unit-test", out, {goto: a["google_title"]})
+        it = (pages.get(goto) or (None,))[0] or {}
+        return it.get("resolved_url")
+    finally:
+        run._fetch, run.api = saved[0], saved[1]
+        run._LOOKUPS.update(saved[2])
 
 
 def unit(case):
@@ -113,6 +154,50 @@ def unit(case):
     if fn == "is_lookalike":
         got = checks.is_lookalike(a["domain"], a["real_domains"])
         return got[0] == exp["value"], f"{got[0]} (closest {got[1]}, similarity {got[2]})"
+    if fn == "headline_core":
+        got = checks.headline_core(a["title"])
+        return got == exp["value"], repr(got)
+    if fn == "same_headline":
+        got = checks.same_headline(a["a"], a["b"])
+        return got == exp["value"], str(got)
+    if fn == "website_cert":
+        o = _website_cert_case(a)
+        fl = [f["flag"] for f in o["red_flags"]]
+        ok = (all(f in fl for f in exp.get("red_flags_include", []))
+              and len(o["unavailable"]) == exp["unavailable"]
+              and all(t in " ".join(u["reason"] for u in o["unavailable"]) for t in exp.get("reason_contains", [])))
+        return ok, f"flags={fl} unavailable={[u['reason'] for u in o['unavailable']]}"
+    if fn == "google_link_resolved":
+        got = _google_link_case(a)
+        return got == exp["value"], repr(got)
+    if fn == "describe_unavailable":
+        got = run.describe_unavailable(a["u"])
+        ok = all(t in got for t in exp.get("contains", [])) and not any(t in got for t in exp.get("not_contains", []))
+        return ok, got
+    if fn == "company_social_page":
+        saved = run.api, run._read_pages, run.gdelt.search
+        goto = "https://www.google.com/goto?url=CAESsocial&gsessionid=x"
+        try:
+            run.gdelt.search = lambda q, job: {"data": {"articles": []}, "retrieved_at": "2026-11-22T00:00:00+00:00"}
+            run.api = lambda ep, body, job: {"data": {"results": [
+                {"position": 1, "url": goto, "title": a["title"], "snippet": "fraud cases involving Shadowfax"}]},
+                "retrieved_at": "2026-11-22T00:00:00+00:00"}
+            run._read_pages = lambda urls, job, out, titles=None: {u: ({
+                "success": True, "url": u, "title": a["page_title"],
+                "content": "<p>" + a["page_text"] + "</p>"}, "2026-11-22T00:00:00+00:00") for u in urls}
+            o = run.step_company_adverse_media("unit-test", a["company_names"], "shadowfax.in")
+        finally:
+            run.api, run._read_pages, run.gdelt.search = saved
+        vs = [h["verdict"] for h in o["data"]["hits"]]
+        fl = [f["flag"] for f in o["red_flags"]]
+        ok = (exp["verdict"] in vs and all(f in fl for f in exp["flags_include"])
+              and not any(f in fl for f in exp["flags_exclude"]))
+        return ok, f"verdicts={vs} flags={fl}"
+    if fn == "decide_missing":
+        d = _decide_case({**a, "return_missing": True})
+        text = " | ".join(d["missing"])
+        ok = d["verdict"] == exp["verdict"] and all(t in text for t in exp.get("missing_contains", []))
+        return ok, f"{d['verdict']}: {text}"
     if fn == "decide":
         got = _decide_case(a)
         return got == exp["verdict"], got
