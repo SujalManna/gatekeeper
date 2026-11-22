@@ -1,0 +1,16 @@
+{
+  "cost_limit_credits_per_run": 60,
+  "time_limit_seconds_per_run": 180,
+  "api_version": "2025-11-01",
+  "base_url": "https://api.crustdata.com",
+  "estimated_cost": {
+    "/company/identify": 0.2,
+    "/company/enrich": 4,
+    "/company/search": 1,
+    "/person/search": 1,
+    "/person/enrich": 9,
+    "/web/search/live": 1,
+    "/web/enrich/live": 1,
+    "/job/search": 1
+  }
+}

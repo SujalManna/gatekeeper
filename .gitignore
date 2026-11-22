@@ -1,0 +1,18 @@
+# secrets
+.env
+.env.*
+
+# generated data: API cache, job database, results
+cache/
+gatekeeper.db
+*.db
+output/
+# raw Crustdata API responses (licensed data, not for a public repo)
+fixtures/
+
+# local environment / build noise
+.venv/
+__pycache__/
+*.pyc
+*.log
+*.tmp
