@@ -4,6 +4,7 @@ Vendor verification for the ContextCon Trust & compliance track: is a new vendor
 run by the people it says**, and are its directors clean in the news, with namesakes cleared.
 Every fact in the answer points at its source.
 
+**Live app:** https://gatekeeper-orpin-rho.vercel.app (sign in with the access token).
 Architecture and data flow: [docs/architecture.md](docs/architecture.md).
 
 ## The job
@@ -153,6 +154,47 @@ $env:APP_ACCESS_TOKEN = "dev-token"; uvicorn server:app --port 8000
 ```powershell
 cd web; npm install; npm run dev
 ```
+
+## Testing
+
+**1. Offline tests (no credits, about 30 s).** These cover:
+
+- the matching rules: names, domains, lookalikes, triage, accusation vs dispute, namesakes and DNS answers
+- the verdict rules
+- the retry deadline
+- a full pipeline run with every Crustdata call timing out (mocked)
+
+```powershell
+python run_tests.py
+```
+
+Expected: `69/69 passed`.
+
+**2. Live end-to-end vendor cases (uses Crustdata credits; cached runs cost almost nothing).**
+
+```powershell
+python run_tests.py --e2e --recheck
+```
+
+Expected: `76/76 passed`, with each case's runtime and credits printed. The expected verdicts:
+
+| Case | Verdict |
+|---|---|
+| Retool | REAL_AND_TRADING |
+| Shadowfax | REAL_AND_TRADING |
+| Grain Garden Delight (real shell company) | LOOKS_OFF |
+| `shadowfaax.in` and `retooI.com` lookalikes | LOOKS_OFF |
+| Borrowed website, made-up vendor, mocked outage | CANNOT_VERIFY |
+
+Use `-k <text>` to run only the cases whose ID contains that text.
+
+**3. The deployed app.** Open the production URL, sign in with `APP_ACCESS_TOKEN`, then:
+
+- **`/api/health`** should show `"storage":"postgres"` and both secrets set.
+- **The API without a token** (for example `/api/checks`) should answer 401.
+- **Run a check:** pick the *Retool · retool.com* chip and click **Run check**. The live trail fills in and the result shows **Real and trading** with evidence links. Turn on *Re-check from saved responses* to repeat it for about 0 credits.
+- **Try a lookalike:** the *A lookalike · retooI.com* chip should come back **Looks off**.
+- **Approval:** Approve and Reject need your name, then confirmation in a dialog. Only do this when you mean it, because it records a real decision.
 
 ## Robustness
 
