@@ -154,10 +154,12 @@ def run_step(job_id, step, fn):
             "SELECT output FROM steps WHERE job_id=? AND step=? AND status='done'",
             (job_id, step),
         ).fetchone()
+    # One write per line (newline included): steps run in parallel threads, and print()'s separate
+    # text/newline writes could interleave two status lines into one.
     if row:
-        print(f"  [skip] {step} already done (resumed)", flush=True)
+        print(f"  [skip] {step} already done (resumed)\n", end="", flush=True)
         return json.loads(row["output"])
-    print(f"  [run ] {step}", flush=True)
+    print(f"  [run ] {step}\n", end="", flush=True)
     out = fn()
     with conn() as c:
         c.execute(
