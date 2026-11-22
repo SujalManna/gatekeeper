@@ -103,6 +103,7 @@ CRUSTDATA_API_KEY=...
 | `python run.py --name "<vendor>" --website "<url>"` | Check a vendor. Running it again **resumes**: finished steps are skipped, API calls come from the cache. |
 | `python run.py ... --recheck` | Re-run every step from cached responses (no re-spend); approvals are kept. |
 | `python approve.py <job_id>` / `--reject` | The only way to mark a vendor cleared. Refuses unless a request is pending and the saved verdict is REAL_AND_TRADING. |
+| `streamlit run app.py` | Web UI: name + website → verdict banner, who runs it, age, red flags, adverse media, evidence with links, cost (credits and ₹), runtime, and an Approve button (REAL_AND_TRADING only; runs `approve.py`). |
 | `python run_tests.py` | Unit + mocked-outage tests: offline, no credits. |
 | `python run_tests.py --e2e [--recheck] [-k text]` | Also the live end-to-end vendor cases, each with its runtime and credits. |
 
