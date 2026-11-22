@@ -14,7 +14,9 @@ import json
 import os
 import re
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
 from urllib.parse import urlparse
@@ -26,6 +28,9 @@ import gdelt
 import store
 
 ACTION = "mark_vendor_cleared"
+STEP_ORDER = ["identify", "company_profile", "who_runs_it", "website_check", "operating_signals",
+              "adverse_media", "company_adverse_media", "entity_resolution", "decide", "approval"]
+MAX_WORKERS = 3  # parallel calls; Crustdata's limit is 30 requests/min per endpoint, GDELT is locked to 1/5s
 VERDICTS = ("REAL_AND_TRADING", "LOOKS_OFF", "CANNOT_VERIFY")
 
 
@@ -448,10 +453,27 @@ def step_who_runs_it(job, company_id):
 
 
 # ---------- step 4: website ----------
+MAX_HUMAN_MODE_PER_RUN = 8   # browser-like fetches are slow; past this, pages count as not read
+_HUMAN = {"used": 0}
+_HUMAN_LOCK = threading.Lock()
+
+
 def _fetch(urls, job, human=False):
     body = {"urls": urls}
     if human:
         body["human_mode"] = True
+        if not os.path.exists(cc._cache_path("/web/enrich/live", body)):  # cached answers are free and fast
+            with _HUMAN_LOCK:
+                allowed = max(0, MAX_HUMAN_MODE_PER_RUN - _HUMAN["used"])
+                take = urls[:allowed]
+                _HUMAN["used"] += len(take)
+            if len(take) < len(urls):
+                skipped = [{"success": False, "url": u, "skipped": f"human_mode cap of {MAX_HUMAN_MODE_PER_RUN} per run"}
+                           for u in urls[len(take):]]
+                if not take:
+                    return {"data": skipped, "retrieved_at": None, "human_mode_capped": True}, body, skipped
+                rec, b, items = _fetch(take, job, human=True)
+                return rec, b, list(items) + skipped
     rec = api("/web/enrich/live", body, job)
     items = first_list(rec.get("data")) if rec.get("data") is not None else []
     def unread(i):
@@ -619,109 +641,121 @@ def step_adverse_media(job, people, company_names, domain):
         out["data"]["complete"] = False
         return out
     out["data"]["sources_degraded"] = []
-    complete, screened, gdelt_down = True, 0, False
-    for person in people:
-        name = person["name"]
-        if checks.is_abbreviated(name):
-            # The surname is hidden at the source, so no search can find or clear this person.
-            # Listed as a gap; the verdict still needs at least one fully screened leader.
-            check(out, f"adverse:{name}", "unclear",
-                  f"name is abbreviated on record (\"{name}\"), so news search can't screen them")
-            flag(out, "leader_not_screenable", "warning",
-                 f"{name}: surname hidden on the profile, so adverse media was not searched for this person")
-            continue
-
-        # 1. Find hits: GDELT first (direct article links + seendate); Crustdata web search only if GDELT fails.
-        hits, source = _adverse_hits_gdelt(job, name, company_names, out) if not gdelt_down else (None, None)
-        if hits is None:
-            if not gdelt_down:
-                gdelt_down = True
-            else:
-                out["data"]["sources_degraded"].append(
-                    {"source": "GDELT", "person": name, "status": "source unavailable", "reason": "skipped: GDELT already failed earlier in this run"})
-            hits, source = _adverse_hits_crustdata(job, name, out)
-        if hits is None:
-            complete = False
-            check(out, f"adverse:{name}", "unclear", "GDELT and Crustdata web search both unavailable")
-            continue
-        hits = [h for h in hits if "linkedin.com/in/" not in h["url"].lower()
-                and checks.domain_of(h["url"]) != domain]
-
-        # 2. Triage on title/snippet before fetching anything.
-        to_read = []
-        for h in hits:
-            needs, why = checks.triage(f"{h['title'] or ''}\n{h.get('snippet') or ''}", name, company_names)
-            h.update({"person": name, "triage": why})
-            if needs:
-                to_read.append(h)
-            else:
-                h.update({"verdict": "not_relevant", "reason": why, "basis": "title/snippet triage",
-                          "passage": checks.norm_space(f"{h['title'] or ''} — {h.get('snippet') or ''}")})
-        # adverse-keyword hits first, then company-only ones; deterministic order
-        to_read.sort(key=lambda h: ("adverse term" not in h["triage"], h["url"]))
-        overflow = to_read[MAX_READ_PER_PERSON:]
-        to_read = to_read[:MAX_READ_PER_PERSON]
-
-        # 3. Read the hits that passed triage.
-        pages = _read_pages([h["url"] for h in to_read], job, out)
-        for h in to_read:
-            it, fat = pages.get(h["url"], (None, None))
-            text = ""
-            if it and it.get("success"):
-                text, _ = checks.html_to_text(it.get("content") or "")
-                if checks.is_interstitial(it.get("title"), text):
-                    text = ""
-            if text and not checks.name_positions((it.get("title") or "") + "\n" + text, name):
-                # The search engine saw the full name here, but the page we got doesn't show it
-                # (login wall, consent page, different landing page): we haven't read what was found.
-                text = ""
-            if text:
-                verdict, reason, psg = checks.classify_hit((it.get("title") or "") + "\n" + text, person,
-                                                           company_names)
-                h.update({"verdict": verdict, "reason": reason, "basis": "page", "passage": psg,
-                          "page_title": it.get("title"), "read_at": fat})
-            elif checks.is_social(h["url"], (it or {}).get("title"), h["title"]):
-                if not _judge_social_wall(job, h, person, company_names, out):
-                    complete = False
-            else:
-                complete = False
-                mark_unavailable(out, f"adverse-media page {h['url']}",
-                                 "passed triage but could not be read (bot check or fetch failure)", "adverse_page")
-                h.update({"verdict": "unreviewed", "basis": "title/snippet only",
-                          "passage": checks.norm_space(f"{h['title'] or ''} — {h.get('snippet') or ''}"),
-                          "reason": "passed triage (" + h["triage"] + ") but the page could not be read, or the "
-                                    "page we got does not show the name; not cleared"})
-        for h in overflow:
-            complete = False
-            h.update({"verdict": "unreviewed", "basis": "title/snippet only", "passage": h["triage"],
-                      "reason": f"passed triage but over the {MAX_READ_PER_PERSON}-page reading cap; not cleared"})
-            mark_unavailable(out, f"adverse-media page {h['url']}", "over the reading cap", "adverse_page")
-
-        # 4. Record every hit with its evidence.
-        for h in hits:
-            out["data"]["hits"].append({k: h.get(k) for k in ("person", "source", "url", "title", "record_date",
-                                                               "verdict", "reason", "basis", "passage")})
-            if h.get("passage"):
-                where = h.get("evidence_source") or (
-                    f"{h['url']} (via crustdata /web/enrich/live)" if h["basis"] == "page" else h["found_via"])
-                ev(out, where, "passage" if h["basis"] in ("page", "readable copy") else "title/snippet",
-                   h["passage"], h.get("read_at") or h["found_at"], h.get("record_date"))
-            if h["verdict"] == "adverse":
-                flag(out, "director_adverse_media", "concrete", f"{name}: {h['url']} — {h['reason']}")
-            elif h["verdict"] == "possible_adverse":
-                flag(out, "possible_director_adverse_media", "warning", f"{name}: {h['url']} — {h['reason']}")
-        counts = {}
-        for h in hits:
-            counts[h["verdict"]] = counts.get(h["verdict"], 0) + 1
-        bad = counts.get("adverse")
-        unsure = counts.get("possible_adverse", 0) + counts.get("unreviewed", 0)
-        screened += 1
-        check(out, f"adverse:{name}", "failed" if bad else "unclear" if unsure else "verified",
-              f"{len(hits)} hits via {source}: "
-              + (", ".join(f"{n} {v}" for v, n in sorted(counts.items())) or "none"))
+    # Each leader is screened independently, so screen them at the same time; results are merged
+    # back in the leaders' order so the output is the same however the threads finish.
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        results = list(pool.map(lambda p: _screen_person(job, p, company_names, domain), people))
+    complete, screened = True, 0
+    for sub, ok, did in results:
+        for k in ("checks", "red_flags", "evidence", "unavailable"):
+            out[k] += sub[k]
+        out["data"]["hits"] += sub["data"]["hits"]
+        out["data"]["sources_degraded"] += sub["data"]["sources_degraded"]
+        complete &= ok
+        screened += did
     out["data"]["complete"] = complete
     out["data"]["leaders_screened"] = screened
     return out
+
+
+def _screen_person(job, person, company_names, domain):
+    """Adverse-media screening for one leader. Returns (its own step output, complete?, screened 0/1)."""
+    out = new_out()
+    out["data"].update({"hits": [], "sources_degraded": []})
+    complete = True
+    name = person["name"]
+    if checks.is_abbreviated(name):
+        # The surname is hidden at the source, so no search can find or clear this person.
+        # Listed as a gap; the verdict still needs at least one fully screened leader.
+        check(out, f"adverse:{name}", "unclear",
+              f"name is abbreviated on record (\"{name}\"), so news search can't screen them")
+        flag(out, "leader_not_screenable", "warning",
+             f"{name}: surname hidden on the profile, so adverse media was not searched for this person")
+        return out, True, 0
+
+    # 1. Find hits: GDELT first (direct article links + seendate); Crustdata web search only if
+    # GDELT fails (after one failure GDELT is skipped for a cooldown, see gdelt.py).
+    hits, source = _adverse_hits_gdelt(job, name, company_names, out)
+    if hits is None:
+        hits, source = _adverse_hits_crustdata(job, name, out)
+    if hits is None:
+        check(out, f"adverse:{name}", "unclear", "GDELT and Crustdata web search both unavailable")
+        return out, False, 0
+    hits = [h for h in hits if "linkedin.com/in/" not in h["url"].lower()
+            and checks.domain_of(h["url"]) != domain]
+
+    # 2. Triage on title/snippet before fetching anything.
+    to_read = []
+    for h in hits:
+        needs, why = checks.triage(f"{h['title'] or ''}\n{h.get('snippet') or ''}", name, company_names)
+        h.update({"person": name, "triage": why})
+        if needs:
+            to_read.append(h)
+        else:
+            h.update({"verdict": "not_relevant", "reason": why, "basis": "title/snippet triage",
+                      "passage": checks.norm_space(f"{h['title'] or ''} — {h.get('snippet') or ''}")})
+    # adverse-keyword hits first, then company-only ones; deterministic order
+    to_read.sort(key=lambda h: ("adverse term" not in h["triage"], h["url"]))
+    overflow = to_read[MAX_READ_PER_PERSON:]
+    to_read = to_read[:MAX_READ_PER_PERSON]
+
+    # 3. Read the hits that passed triage.
+    pages = _read_pages([h["url"] for h in to_read], job, out)
+    for h in to_read:
+        it, fat = pages.get(h["url"], (None, None))
+        text = ""
+        if it and it.get("success"):
+            text, _ = checks.html_to_text(it.get("content") or "")
+            if checks.is_interstitial(it.get("title"), text):
+                text = ""
+        if text and not checks.name_positions((it.get("title") or "") + "\n" + text, name):
+            # The search engine saw the full name here, but the page we got doesn't show it
+            # (login wall, consent page, different landing page): we haven't read what was found.
+            text = ""
+        if text:
+            verdict, reason, psg = checks.classify_hit((it.get("title") or "") + "\n" + text, person,
+                                                       company_names)
+            h.update({"verdict": verdict, "reason": reason, "basis": "page", "passage": psg,
+                      "page_title": it.get("title"), "read_at": fat})
+        elif checks.is_social(h["url"], (it or {}).get("title"), h["title"]):
+            if not _judge_social_wall(job, h, person, company_names, out):
+                complete = False
+        else:
+            complete = False
+            mark_unavailable(out, f"adverse-media page {h['url']}",
+                             "passed triage but could not be read (bot check or fetch failure)", "adverse_page")
+            h.update({"verdict": "unreviewed", "basis": "title/snippet only",
+                      "passage": checks.norm_space(f"{h['title'] or ''} — {h.get('snippet') or ''}"),
+                      "reason": "passed triage (" + h["triage"] + ") but the page could not be read, or the "
+                                "page we got does not show the name; not cleared"})
+    for h in overflow:
+        complete = False
+        h.update({"verdict": "unreviewed", "basis": "title/snippet only", "passage": h["triage"],
+                  "reason": f"passed triage but over the {MAX_READ_PER_PERSON}-page reading cap; not cleared"})
+        mark_unavailable(out, f"adverse-media page {h['url']}", "over the reading cap", "adverse_page")
+
+    # 4. Record every hit with its evidence.
+    for h in hits:
+        out["data"]["hits"].append({k: h.get(k) for k in ("person", "source", "url", "title", "record_date",
+                                                           "verdict", "reason", "basis", "passage")})
+        if h.get("passage"):
+            where = h.get("evidence_source") or (
+                f"{h['url']} (via crustdata /web/enrich/live)" if h["basis"] == "page" else h["found_via"])
+            ev(out, where, "passage" if h["basis"] in ("page", "readable copy") else "title/snippet",
+               h["passage"], h.get("read_at") or h["found_at"], h.get("record_date"))
+        if h["verdict"] == "adverse":
+            flag(out, "director_adverse_media", "concrete", f"{name}: {h['url']} — {h['reason']}")
+        elif h["verdict"] == "possible_adverse":
+            flag(out, "possible_director_adverse_media", "warning", f"{name}: {h['url']} — {h['reason']}")
+    counts = {}
+    for h in hits:
+        counts[h["verdict"]] = counts.get(h["verdict"], 0) + 1
+    bad = counts.get("adverse")
+    unsure = counts.get("possible_adverse", 0) + counts.get("unreviewed", 0)
+    check(out, f"adverse:{name}", "failed" if bad else "unclear" if unsure else "verified",
+          f"{len(hits)} hits via {source}: "
+          + (", ".join(f"{n} {v}" for v, n in sorted(counts.items())) or "none"))
+    return out, complete, 1
 
 
 MAX_READ_PER_PERSON = 10
@@ -755,37 +789,55 @@ def step_company_adverse_media(job, company_names, domain):
 
     # Both sources, every time: GDELT returning nothing is not proof of no coverage (it holds about
     # three months of mostly large outlets), so Crustdata web search always runs too.
-    hits, sources = [], []
-    for qn in qnames[:2]:
-        q = f'"{qn}" (' + " OR ".join(COMPANY_QUERY_TERMS) + ")"
-        rec = gdelt.search(q, job)
-        if rec.get("data") is not None:
+    def search_one(qn, which):
+        """One search (GDELT or Crustdata) for one company name, into its own output (merged in order)."""
+        sub = new_out()
+        sub["data"].update({"hits": [], "sources": [], "degraded": [], "complete": True})
+        if which == "gdelt":
+            q = f'"{qn}" (' + " OR ".join(COMPANY_QUERY_TERMS) + ")"
+            rec = gdelt.search(q, job)
+            if rec.get("data") is None:
+                sub["data"]["degraded"].append({"source": "GDELT", "company": qn, "status": "source unavailable",
+                                                "reason": rec.get("unavailable_reason"),
+                                                "note": "Crustdata web search still covers this company"})
+                return sub
             arts = (rec["data"] or {}).get("articles") or []
             fv = f"gdelt doc api query={q!r}"
-            ev(out, fv, "count(articles)", len(arts), rec["retrieved_at"])
-            hits += [{"source": "gdelt", "url": a.get("url"), "title": a.get("title"), "snippet": None,
-                      "record_date": gdelt.seendate_iso(a.get("seendate")), "found_via": fv,
-                      "found_at": rec["retrieved_at"]} for a in arts if a.get("url")]
-            sources.append(f"GDELT ({len(arts)})")
-        else:
-            d["sources_degraded"].append({"source": "GDELT", "company": qn, "status": "source unavailable",
-                                          "reason": rec.get("unavailable_reason"),
-                                          "note": "Crustdata web search still covers this company"})
+            ev(sub, fv, "count(articles)", len(arts), rec["retrieved_at"])
+            sub["data"]["hits"] = [{"source": "gdelt", "url": a.get("url"), "title": a.get("title"), "snippet": None,
+                                    "record_date": gdelt.seendate_iso(a.get("seendate")), "found_via": fv,
+                                    "found_at": rec["retrieved_at"]} for a in arts if a.get("url")]
+            sub["data"]["sources"].append(f"GDELT ({len(arts)})")
+            return sub
         cq = f'"{qn}" ' + " OR ".join(COMPANY_QUERY_TERMS)
         body = {"query": cq, "sources": ["web", "news"]}
         crec = api("/web/search/live", body, job)
         if crec.get("data") is None:
-            mark_unavailable(out, f"/web/search/live for company \"{qn}\" (GDELT fallback)", crec)
-            d["complete"] = False
-            continue
+            mark_unavailable(sub, f"/web/search/live for company \"{qn}\"", crec)
+            sub["data"]["complete"] = False
+            return sub
         s = src("/web/search/live", body)
         res = [r for r in ((crec["data"] or {}).get("results") or []) if r.get("url")]
         res.sort(key=lambda r: (int(r.get("position") or 99), r["url"]))
-        ev(out, s, "count(results)", len(res), crec["retrieved_at"])
-        hits += [{"source": "crustdata_web_search", "url": r["url"], "title": r.get("title"),
-                  "snippet": r.get("snippet"), "record_date": None, "found_via": s,
-                  "found_at": crec["retrieved_at"]} for r in res]
-        sources.append(f"Crustdata web search ({len(res)})")
+        ev(sub, s, "count(results)", len(res), crec["retrieved_at"])
+        sub["data"]["hits"] = [{"source": "crustdata_web_search", "url": r["url"], "title": r.get("title"),
+                                "snippet": r.get("snippet"), "record_date": None, "found_via": s,
+                                "found_at": crec["retrieved_at"]} for r in res]
+        sub["data"]["sources"].append(f"Crustdata web search ({len(res)})")
+        return sub
+
+    # Every (name, source) search is independent: run them together, merge in a fixed order.
+    tasks = [(qn, w) for qn in qnames[:2] for w in ("gdelt", "crustdata")]
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        subs = list(pool.map(lambda t: search_one(*t), tasks))
+    hits, sources = [], []
+    for sub in subs:
+        for k in ("evidence", "unavailable"):
+            out[k] += sub[k]
+        hits += sub["data"]["hits"]
+        sources += sub["data"]["sources"]
+        d["sources_degraded"] += sub["data"]["degraded"]
+        d["complete"] &= sub["data"]["complete"]
 
     seen, uniq = set(), []
     for h in hits:
@@ -807,14 +859,15 @@ def step_company_adverse_media(job, company_names, domain):
         else:
             h.update({"verdict": "not_relevant", "reason": why, "basis": "title/snippet triage",
                       "passage": checks.norm_space(f"{h['title'] or ''} — {h.get('snippet') or ''}")})
-    to_read.sort(key=lambda h: (h["snippet_verdict"] != "adverse", h["url"]))
+    rank = {"adverse": 0, "possible_adverse": 1}
+    to_read.sort(key=lambda h: (rank.get(h["snippet_verdict"], 2), h["url"]))
     overflow, to_read = to_read[MAX_READ_PER_COMPANY:], to_read[:MAX_READ_PER_COMPANY]
 
     def judge_unread(h, why_unread):
         """A triage-passed page we didn't read: it blocks only if its own title/snippet already
         shows accusing wording next to the company's name."""
         snip = checks.norm_space(f"{h['title'] or ''} — {h.get('snippet') or ''}")
-        if h["snippet_verdict"] == "adverse":
+        if h["snippet_verdict"] in ("adverse", "possible_adverse"):
             d["complete"] = False
             mark_unavailable(out, f"company adverse-media page {h['url']}", why_unread, "adverse_page")
             h.update({"verdict": "unreviewed", "basis": "title/snippet only", "passage": snip,
@@ -863,10 +916,15 @@ def step_company_adverse_media(job, company_names, domain):
         if h["verdict"] == "adverse":
             flag(out, "company_adverse_media", "concrete",
                  f"article accuses the company itself: {h['url']} (\"{h.get('page_title') or h['title']}\") — {h['reason']}")
+        elif h["verdict"] == "possible_adverse":
+            flag(out, "company_possible_adverse", "warning",
+                 f"article puts the company in a dispute or case (not fraud/crime): {h['url']} "
+                 f"(\"{h.get('page_title') or h['title']}\") — {h['reason']}")
     counts = {}
     for h in hits:
         counts[h["verdict"]] = counts.get(h["verdict"], 0) + 1
-    status = ("failed" if counts.get("adverse") else "unclear" if counts.get("unreviewed") or not d["complete"]
+    status = ("failed" if counts.get("adverse") else
+              "unclear" if counts.get("unreviewed") or counts.get("possible_adverse") or not d["complete"]
               else "verified")
     check(out, "company_adverse_media", status,
           f"{len(hits)} hits via {', '.join(sources) or 'no source'}: "
@@ -970,14 +1028,16 @@ def _read_pages(urls, job, out):
     pages = {}
     redirect = [u for u in urls if "google.com/goto" in u]
     direct = [u for u in urls if u not in redirect]
-    for batch, human in ((direct, False), (redirect, True)):
-        for i in range(0, len(batch), 10):
-            chunk = batch[i:i + 10]
-            frec, _, items = _fetch(chunk, job, human=human)
-            if frec.get("data") is None:
-                mark_unavailable(out, f"/web/enrich/live for {len(chunk)} adverse-media page(s)", frec)
-            for u, it in zip(chunk, items):
-                pages[u] = (it, frec.get("retrieved_at"))
+    jobs = [(batch[i:i + 10], human) for batch, human in ((direct, False), (redirect, True))
+            for i in range(0, len(batch), 10)]
+    # Direct and redirect batches are independent calls: fetch them at the same time.
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+        results = list(pool.map(lambda j: (j[0], _fetch(j[0], job, human=j[1])), jobs))
+    for chunk, (frec, _, items) in results:
+        if frec.get("data") is None:
+            mark_unavailable(out, f"/web/enrich/live for {len(chunk)} adverse-media page(s)", frec)
+        for u, it in zip(chunk, items):
+            pages[u] = (it, frec.get("retrieved_at"))
 
     def unread(u):
         it = (pages.get(u) or (None,))[0] or {}
@@ -1187,7 +1247,7 @@ def step_decide(outs):
                                and not any(h["verdict"] in ("adverse", "possible_adverse", "unreviewed")
                                            for h in adv["data"].get("hits", [])),
         "company_adverse_clear": bool(cadv["data"].get("complete"))
-                                 and not any(h["verdict"] in ("adverse", "unreviewed")
+                                 and not any(h["verdict"] in ("adverse", "possible_adverse", "unreviewed")
                                              for h in cadv["data"].get("hits", [])),
     }
     why = {
@@ -1276,6 +1336,7 @@ def main():
     if a.recheck:
         store.reset_job_steps(job)
     limit = cc.CFG.get("time_limit_seconds_per_run", 180)
+    cc.DEADLINE = t0 + limit - 15  # leaves room to decide and write the output
     print(f"job {job}  ({name} / {domain})")
 
     outs, stopped = {}, None
@@ -1283,23 +1344,42 @@ def main():
     def run(step, fn):
         if time.time() - t0 > limit:
             raise StopRun(f"time limit of {limit}s reached before step {step}")
+        s0 = time.time()
         outs[step] = store.run_step(job, step, fn)
+        step_seconds[step] = round(time.time() - s0, 1)
         if outs[step].get("unavailable") or (step in ("decide", "approval") and any(
                 o.get("unavailable") for o in outs.values())):
             store.reset_step(job, step)  # re-run it next time; cached calls inside it cost nothing
         return outs[step]
 
+    step_seconds = {}
+
+    def in_order():
+        """Parallel steps finish in any order; keep outputs (and so evidence/checks) in pipeline order."""
+        items = sorted(outs.items(), key=lambda kv: STEP_ORDER.index(kv[0]) if kv[0] in STEP_ORDER else 99)
+        outs.clear()
+        outs.update(items)
+
+    def run_parallel(*steps):
+        """Independent steps at the same time; each is still saved on its own when it finishes."""
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as pool:
+            futures = [pool.submit(run, s, f) for s, f in steps]
+            return [f.result() for f in futures]
+
     try:
         ident = run("identify", lambda: step_identify(job, name, domain))
         cid = ident["data"]["company_id"]
         prof = run("company_profile", lambda: step_company_profile(job, cid, domain))
-        ppl = run("who_runs_it", lambda: step_who_runs_it(job, cid))
-        web = run("website_check", lambda: step_website_check(job, website, name, prof["data"]))
-        run("operating_signals", lambda: step_operating_signals(job, cid, prof["data"], web))
+        ppl, web = run_parallel(
+            ("who_runs_it", lambda: step_who_runs_it(job, cid)),
+            ("website_check", lambda: step_website_check(job, website, name, prof["data"])))
+        cnames = sorted(n for n in {name, prof["data"].get("name")} if n)
+        run_parallel(
+            ("operating_signals", lambda: step_operating_signals(job, cid, prof["data"], web)),
+            ("adverse_media", lambda: step_adverse_media(job, ppl["data"]["people"], cnames, domain)),
+            ("company_adverse_media", lambda: step_company_adverse_media(job, cnames, domain)))
         run("entity_resolution", lambda: step_entity_resolution(outs, name, domain))
-        cnames = [n for n in {name, prof["data"].get("name")} if n]
-        run("adverse_media", lambda: step_adverse_media(job, ppl["data"]["people"], cnames, domain))
-        run("company_adverse_media", lambda: step_company_adverse_media(job, cnames, domain))
+        in_order()
         dec = run("decide", lambda: step_decide(outs))
         verdict = dec["data"]["verdict"]
 
@@ -1321,6 +1401,7 @@ def main():
               "Run the same command again to resume.")
         return 130
 
+    in_order()
     dec = outs.get("decide", {}).get("data")
     unavailable = [u for o in outs.values() for u in o.get("unavailable", [])]
     if dec:
@@ -1368,6 +1449,7 @@ def main():
         "cost_credits": round(store.job_cost(job), 2),
         "run_cost_credits": round(cc.RUN_SPENT.get(job, 0), 2),
         "runtime_seconds": round(time.time() - t0, 1),
+        "step_seconds": {k: step_seconds[k] for k in STEP_ORDER if k in step_seconds},
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
     store.finish_job(job, {"verdict": verdict}, status="done" if not stopped else "stopped")

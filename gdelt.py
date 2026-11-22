@@ -9,6 +9,7 @@ GDELT allows one request every 5 seconds, so calls are spaced across processes t
 import hashlib
 import json
 import os
+import threading
 import time
 from datetime import datetime, timezone
 
@@ -21,9 +22,12 @@ ENDPOINT = "gdelt /api/v2/doc/doc"
 CACHE_DIR = "cache"
 LAST_CALL = os.path.join(CACHE_DIR, ".gdelt_last_call")
 MIN_GAP = 5.5        # GDELT: "Please limit requests to one every 5 seconds"
-ATTEMPTS = 2         # a slow GDELT must not eat the run's time budget; Crustdata search is the fallback
-TIMEOUT = 25
+ATTEMPTS = 1         # a slow GDELT must not eat the run's time budget; Crustdata search is the fallback
+TIMEOUT = 10
+COOLDOWN = 15 * 60   # after a failure, skip GDELT for this long, across runs
+DOWN_FILE = os.path.join(CACHE_DIR, ".gdelt_down")
 os.makedirs(CACHE_DIR, exist_ok=True)
+_LOCK = threading.Lock()  # steps search in parallel; GDELT's one-request-per-5s rule is global
 
 
 def _cache_path(params):
@@ -52,11 +56,24 @@ def seendate_iso(s):
         return s
 
 
-_DOWN = None  # set after GDELT gives up once in this process, so later searches don't wait on it again
+def _down_reason():
+    """GDELT failed within the cooldown window (in this run or an earlier one)? Returns the reason."""
+    try:
+        with open(DOWN_FILE, encoding="utf-8") as f:
+            at, reason = f.read().split("\n", 1)
+        if time.time() - float(at) < COOLDOWN:
+            return reason
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _mark_down(reason):
+    with open(DOWN_FILE, "w", encoding="utf-8") as f:
+        f.write(f"{time.time()}\n{reason[:200]}")
 
 
 def search(query, job_id, maxrecords=25):
-    global _DOWN
     params = {"query": query, "mode": "artlist", "format": "json", "maxrecords": maxrecords}
     path = _cache_path(params)
     if os.path.exists(path):
@@ -65,9 +82,15 @@ def search(query, job_id, maxrecords=25):
         store.log_cost(job_id, ENDPOINT, 0, True, 200)
         rec["cached"] = True
         return rec
-    if _DOWN:
+    with _LOCK:
+        return _search_live(params, path, job_id)
+
+
+def _search_live(params, path, job_id):
+    down = _down_reason()
+    if down:
         return {"data": None, "error": "source unavailable after retries",
-                "unavailable_reason": f"skipped: GDELT already failed earlier in this run ({_DOWN})",
+                "unavailable_reason": f"skipped: GDELT failed within the last {COOLDOWN // 60} min ({down})",
                 "endpoint": ENDPOINT, "retrieved_at": None, "cached": False}
 
     reason, delay = None, 6
@@ -105,7 +128,7 @@ def search(query, job_id, maxrecords=25):
             time.sleep(wait)
             delay *= 2
     store.log_cost(job_id, ENDPOINT, 0, False, -1)
-    _DOWN = reason[:120]
+    _mark_down(reason)
     return {"data": None, "error": "source unavailable after retries",
             "unavailable_reason": f"{reason} after {ATTEMPTS} attempts",
             "endpoint": ENDPOINT, "retrieved_at": None, "cached": False}

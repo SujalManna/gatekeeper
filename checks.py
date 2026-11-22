@@ -290,7 +290,9 @@ def keywords(text):
 # ---------- adverse media rules ----------
 ADVERSE_TERMS = [r"fraud\w*", r"arrest\w*", r"scam\w*", r"lawsuits?", r"shell compan(?:y|ies)", r"cheat\w*",
                  r"embezzl\w*", r"money[- ]launder\w*", r"sued", r"charged with", r"convicted", r"indicted",
-                 r"fir (?:against|registered)", r"ponzi", r"abscond\w*", r"forger\w*"]
+                 r"fir (?:against|registered)", r"ponzi", r"abscond\w*", r"forger\w*", r"sanctioned"]
+# Words that name a dispute, not wrongdoing: on their own they never make LOOKS_OFF.
+DISPUTE_ONLY = re.compile(r"^(lawsuits?|sued|fir (?:against|registered))$")
 ROLE_TERMS = ["co-founder", "cofounder", "founder", "chief executive", "ceo", "managing director",
               "director", "chairman", "chairperson", "owner", "proprietor", "partner", "cto", "coo", "cfo"]
 
@@ -440,7 +442,12 @@ def classify_company_hit(text, company_names, window=300):
     shell/front/dummy firm, set up to route or launder money, its directors/promoters arrested,
     an FIR/case against it, or it being booked/raided. A mention where it is impersonated,
     the victim, or the complainant is not an accusation.
-    Returns (verdict, reason, passage): adverse | not_adverse | no_adverse_content | not_about_company."""
+    Returns (verdict, reason, passage):
+      adverse            accused of fraud / cheating / money laundering, a shell/fake/bogus company, the
+                         company or its directors arrested or charged, or sanctioned  -> LOOKS_OFF
+      possible_adverse   only a plain FIR, lawsuit, raid or commercial/payment dispute -> human review
+      not_adverse        impersonated, victim or complainant
+      no_adverse_content | not_about_company"""
     text = text or ""
     low = text.lower()
     mentions = []
@@ -453,20 +460,39 @@ def classify_company_hit(text, company_names, window=300):
         a, b = max(0, s - window), min(len(text), e + window)
         win = low[a:b]
         co = p.pattern
-        directed = re.search(
-            rf"(?:fir|case|complaint|chargesheet|charges?)\s+(?:\w+\s+){{0,3}}against\s+(?:the\s+)?(?:company\s+)?{co}"
-            rf"|{co}(?:\W+\w+){{0,3}}?\W+(?:was|has been|were|is)?\s*(?:booked|charged|accused|indicted|raided)\b"
-            rf"|raid\w*\s+(?:on|at)\s+(?:the\s+)?(?:offices?\s+of\s+)?{co}", win, re.I)
+        crime = r"(?:fraud\w*|cheat\w*|defraud\w*|money[- ]launder\w*|forger\w*|scam\w*|embezzl\w*)"
+        # Serious: an accusation of fraud / a crime / a sham company / sanctions -> LOOKS_OFF.
+        serious = (ENTITY_CUES.search(win) or LEADER_ARREST.search(win) or re.search(
+            rf"{co}(?:\W+\w+){{0,4}}?\W+(?:was\s+|were\s+|has been\s+|is\s+)?(?:charged|charge-?sheeted|indicted|convicted)\b"
+            rf"|{co}(?:\W+\w+){{0,6}}?\W+(?:accused of|allegedly|involved in|probed for|under investigation for|"
+            rf"booked for|booked under|charged with)\W+(?:\w+\W+){{0,4}}?{crime}"
+            rf"|(?:police|cops|ed|cbi|eow)\s+(?:have\s+)?booked\s+(?:the\s+)?(?:company\s+)?{co}(?:\W+\w+){{0,6}}?\W+(?:for|under)\W+(?:\w+\W+){{0,4}}?{crime}"
+            rf"|{crime}\s+(?:\w+\s+){{0,2}}(?:by|at|involving)\s+(?:the\s+)?{co}"
+            rf"|(?:charge-?sheet\w*|charges?)\s+(?:\w+\s+){{0,3}}against\s+(?:the\s+)?(?:company\s+)?{co}"
+            rf"|sanctioned\s+(?:the\s+)?(?:company\s+)?{co}|sanctions?\s+(?:\w+\s+){{0,3}}(?:on|against)\s+(?:the\s+)?{co}"
+            rf"|{co}(?:\W+\w+){{0,6}}?\W+(?:was\s+|has been\s+)?(?:sanctioned|blacklisted|debarred)\b", win, re.I))
+        # Dispute: a plain FIR / lawsuit / commercial or payment dispute / raid -> possible_adverse only.
+        dispute = re.search(
+            rf"(?:fir|case|complaint|suit|lawsuit|petition)\s+(?:\w+\s+){{0,3}}against\s+(?:the\s+)?(?:company\s+)?{co}"
+            rf"|{co}(?:\W+\w+){{0,3}}?\W+(?:was\s+|has been\s+)?(?:sued|raided)\b|sued\s+(?:the\s+)?{co}"
+            rf"|{co}(?:\W+\w+){{0,3}}?\W+(?:was\s+|is\s+|has been\s+)?accused of\b"
+            rf"|(?:police|cops)\s+(?:have\s+)?booked\s+(?:the\s+)?{co}|{co}(?:\W+\w+){{0,3}}?\W+booked\s+(?:under|by)\b"
+            rf"|raid(?:s|ed)?\s+(?:on\s+|at\s+)?(?:the\s+)?(?:offices?\s+|premises\s+)?(?:of\s+)?{co}"
+            rf"|{co}(?:\W+\w+){{0,8}}?\W+(?:payment dispute|commercial dispute|legal dispute|unpaid dues|arbitration|"
+            rf"insolvency petition|defaulted on)", win, re.I)
         complainant = re.search(
             rf"{co}\s+(?:has\s+|had\s+)?(?:filed|lodged|registered)\s+(?:a\s+|an\s+)?(?:police\s+)?(?:fir|complaint|case)",
             win, re.I)
         imp = IMPERSONATION.search(win)
-        cue = directed or ENTITY_CUES.search(win) or LEADER_ARREST.search(win)
-        if cue and not imp and not complainant:
-            cand = (3, "adverse", f"\"{n}\" with accusing wording \"{checks_trim(cue.group())}\" next to it", s, e)
-        elif cue:
+        if serious and not imp and not complainant:
+            cand = (4, "adverse", f"\"{n}\" with accusing wording \"{checks_trim(serious.group())}\" next to it", s, e)
+        elif (serious or dispute) and (imp or complainant):
             why = (f"impersonated (\"{imp.group()}\")" if imp else "the complainant")
             cand = (2, "not_adverse", f"\"{n}\" is {why} here, not accused", s, e)
+        elif dispute:
+            cand = (3, "possible_adverse",
+                    f"\"{n}\" is in a dispute or case (\"{checks_trim(dispute.group())}\"), not accused of fraud, a "
+                    "crime or being a sham; needs a human to read it", s, e)
         else:
             cand = (1, "no_adverse_content", f"names \"{n}\" but no accusing wording next to it", s, e)
         if best is None or cand[0] > best[0]:
@@ -547,6 +573,11 @@ def classify_hit(text, person, company_names, window=600):
     if not has_adv:
         return ("no_adverse_content",
                 f"mentions \"{name}\" with {', '.join(ctx)}, but no adverse term near the name", snippet)
+    if all(DISPUTE_ONLY.match(t) for t in adverse):
+        # A plain lawsuit / FIR / dispute isn't an accusation of fraud or a crime: a human reads it.
+        return ("possible_adverse",
+                f"mentions \"{name}\" with {', '.join(ctx)} near \"{', '.join(adverse)}\": a dispute or case, "
+                f"not an accusation of fraud or arrest; needs a human to read it", snippet)
     if company_hit:
         return ("adverse", f"mentions \"{name}\" with {', '.join(ctx)} and \"{', '.join(adverse)}\" near the name",
                 snippet)

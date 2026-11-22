@@ -29,6 +29,9 @@ class BudgetExceeded(Exception):
 
 
 RUN_SPENT = {}  # credits spent per job in this process (one run)
+DEADLINE = None  # epoch seconds; set by run.py so retries never push a run past its time limit
+DEFAULT_TIMEOUT = 30
+TIMEOUTS = {"/web/search/live": 30, "/web/enrich/live": 45}  # slow live endpoints; human_mode fetches need room
 
 
 def _cache_path(endpoint, body):
@@ -83,30 +86,46 @@ def call(endpoint, body, job_id="adhoc", method="POST"):
         "content-type": "application/json",
     }
     url = CFG["base_url"] + endpoint
-    attempts, delay, reason = 5, 2, None
+    attempts, delay, reason, r = 5, 2, None, None
     for attempt in range(1, attempts + 1):
+        t_out = TIMEOUTS.get(endpoint, DEFAULT_TIMEOUT)
+        if DEADLINE is not None:
+            left = DEADLINE - time.time()
+            if left < 3:
+                reason = (reason + "; " if reason else "") + "no time left in this run"
+                store.log_retry(job_id, endpoint, attempt, reason, 0, gave_up=True)
+                print(f"    {reason} on {endpoint}; giving up")
+                break
+            t_out = min(t_out, left)
         try:
-            r = (requests.post(url, headers=headers, json=body, timeout=60)
-                 if method == "POST" else requests.get(url, headers=headers, timeout=60))
+            r = (requests.post(url, headers=headers, json=body, timeout=t_out)
+                 if method == "POST" else requests.get(url, headers=headers, timeout=t_out))
         except requests.RequestException as e:
             reason = f"{type(e).__name__}: {str(e)[:200]}"
         else:
             if r.status_code != 429 and r.status_code < 500:
                 break
             reason = f"HTTP {r.status_code}"
-        last = attempt == attempts
+        # A retry that couldn't finish before the run's deadline isn't started: the source is
+        # "unavailable" (CANNOT_VERIFY), which beats overrunning the time limit.
+        no_time = DEADLINE is not None and time.time() + delay + 5 > DEADLINE
+        last = attempt == attempts or no_time
+        if no_time and attempt < attempts:
+            reason += "; no time left in this run for another try"
         wait = 0 if last else delay
         # Every retry is logged, and so is giving up, so "slow" is never confused with "missing".
         store.log_retry(job_id, endpoint, attempt, reason, wait, gave_up=last)
         print(f"    {reason} on {endpoint} (attempt {attempt}/{attempts})"
               + ("; giving up" if last else f"; retry in {wait}s"))
-        if not last:
-            time.sleep(wait)
-            delay *= 2
-    else:
+        if last:
+            r = None
+            break
+        time.sleep(wait)
+        delay *= 2
+    if r is None or (r.status_code == 429 or r.status_code >= 500):
         store.log_cost(job_id, endpoint, 0, False, -1)
         return {"data": None, "error": "source unavailable after retries",
-                "unavailable_reason": f"{reason} after {attempts} attempts",
+                "unavailable_reason": f"{reason} after {attempt} attempt(s)",
                 "endpoint": endpoint, "retrieved_at": None, "cached": False}
 
     retrieved_at = datetime.now(timezone.utc).isoformat(timespec="seconds")

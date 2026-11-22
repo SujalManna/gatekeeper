@@ -19,8 +19,12 @@ os.chdir(HERE)
 sys.path.insert(0, HERE)
 
 import checks  # noqa: E402
+import crust_client as cc  # noqa: E402
 import run  # noqa: E402
 import store  # noqa: E402
+
+with open("config.json", encoding="utf-8") as _f:
+    TIME_LIMIT = json.load(_f).get("time_limit_seconds_per_run", 180)
 
 
 # ---------- unit ----------
@@ -76,6 +80,30 @@ def unit(case):
     if fn == "classify_company_hit":
         v, reason, _ = checks.classify_company_hit(a["text"], a["company_names"])
         return v == exp["verdict"], f"{v} ({reason})"
+    if fn == "deadline_gives_up":
+        # A stalled endpoint must give up before the run's deadline instead of retrying past it.
+        import requests, tempfile, time as _t
+        work = tempfile.mkdtemp(prefix="gatekeeper_deadline_")
+        shutil.copy("config.json", work)
+        old_cwd, old_post, old_deadline = os.getcwd(), requests.post, cc.DEADLINE
+        old_db = store.DB_PATH
+        try:
+            os.chdir(work)
+            store.DB_PATH = os.path.join(work, "t.db")
+            def slow(*_a, **k):
+                _t.sleep(min(k.get("timeout", 30), a["stall_seconds"]))
+                raise requests.Timeout("simulated stall")
+            requests.post = slow
+            cc.DEADLINE = _t.time() + a["deadline_seconds"]
+            t0 = _t.time()
+            rec = cc.call("/web/search/live", {"query": f"deadline {t0}"}, "deadline-test")
+            took = _t.time() - t0
+        finally:
+            requests.post, cc.DEADLINE, store.DB_PATH = old_post, old_deadline, old_db
+            os.chdir(old_cwd)
+            shutil.rmtree(work, ignore_errors=True)
+        ok = rec["data"] is None and took <= a["deadline_seconds"]
+        return ok, f"gave up after {took:.1f}s (deadline {a['deadline_seconds']}s): {rec.get('unavailable_reason')}"
     if fn == "classify_doh":
         got = checks.classify_doh(a["answer"])
         return got == exp["value"], got
@@ -160,7 +188,10 @@ def e2e(case, recheck):
         problems.append(f"run.py exit code {code}")
     if problems:
         return "FAIL", "; ".join(problems)
-    info = f"{r['verdict']}, {r['cost_credits']} credits (job total)"
+    info = (f"{r['verdict']}, {r['runtime_seconds']}s, {r.get('run_cost_credits', '?')} credits this run "
+            f"({r['cost_credits']} job total)")
+    if r["runtime_seconds"] > TIME_LIMIT:
+        return "FAIL", f"{info}; took longer than the {TIME_LIMIT}s limit"
     if case.get("target"):
         missed = check_result(r, case["target"])
         if missed:
