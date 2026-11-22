@@ -52,7 +52,11 @@ def seendate_iso(s):
         return s
 
 
+_DOWN = None  # set after GDELT gives up once in this process, so later searches don't wait on it again
+
+
 def search(query, job_id, maxrecords=25):
+    global _DOWN
     params = {"query": query, "mode": "artlist", "format": "json", "maxrecords": maxrecords}
     path = _cache_path(params)
     if os.path.exists(path):
@@ -61,6 +65,10 @@ def search(query, job_id, maxrecords=25):
         store.log_cost(job_id, ENDPOINT, 0, True, 200)
         rec["cached"] = True
         return rec
+    if _DOWN:
+        return {"data": None, "error": "source unavailable after retries",
+                "unavailable_reason": f"skipped: GDELT already failed earlier in this run ({_DOWN})",
+                "endpoint": ENDPOINT, "retrieved_at": None, "cached": False}
 
     reason, delay = None, 6
     for attempt in range(1, ATTEMPTS + 1):
@@ -97,6 +105,7 @@ def search(query, job_id, maxrecords=25):
             time.sleep(wait)
             delay *= 2
     store.log_cost(job_id, ENDPOINT, 0, False, -1)
+    _DOWN = reason[:120]
     return {"data": None, "error": "source unavailable after retries",
             "unavailable_reason": f"{reason} after {ATTEMPTS} attempts",
             "endpoint": ENDPOINT, "retrieved_at": None, "cached": False}

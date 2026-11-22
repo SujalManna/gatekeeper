@@ -28,6 +28,9 @@ class BudgetExceeded(Exception):
     pass
 
 
+RUN_SPENT = {}  # credits spent per job in this process (one run)
+
+
 def _cache_path(endpoint, body):
     h = hashlib.sha256((endpoint + json.dumps(body, sort_keys=True)).encode()).hexdigest()[:20]
     return os.path.join(CACHE_DIR, f"{endpoint.strip('/').replace('/', '_')}_{h}.json")
@@ -67,9 +70,11 @@ def call(endpoint, body, job_id="adhoc", method="POST"):
         return rec
 
     est = _estimate(endpoint, body)
-    if store.job_cost(job_id) + est > CFG["cost_limit_credits_per_run"]:
+    # Per run, as the config key says. Counting the job's lifetime spend instead would leave a job
+    # that once hit the cap unable ever to resume; the ledger still keeps the job total.
+    if RUN_SPENT.get(job_id, 0) + est > CFG["cost_limit_credits_per_run"]:
         raise BudgetExceeded(
-            f"{endpoint} would push job {job_id} over {CFG['cost_limit_credits_per_run']} credits"
+            f"{endpoint} would push this run of job {job_id} over {CFG['cost_limit_credits_per_run']} credits"
         )
 
     headers = {
@@ -108,6 +113,7 @@ def call(endpoint, body, job_id="adhoc", method="POST"):
     ok = r.status_code == 200
     credits, credits_source = _actual_credits(r, est if ok else 0)
     store.log_cost(job_id, endpoint, credits, False, r.status_code)
+    RUN_SPENT[job_id] = RUN_SPENT.get(job_id, 0) + credits
     try:
         data = r.json()
     except ValueError:

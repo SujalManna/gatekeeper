@@ -26,12 +26,34 @@ def norm_name(s):
     return " ".join(t for t in s.split() if t not in LEGAL_SUFFIXES)
 
 
+# Descriptor words that don't identify a company: 'Shadowfax Technologies' is still 'Shadowfax'.
+GENERIC_WORDS = {
+    "technologies", "technology", "tech", "solutions", "services", "service", "systems", "software",
+    "labs", "lab", "global", "international", "india", "group", "holdings", "ventures", "enterprises",
+    "industries", "infotech", "networks", "digital", "and",
+}
+MIN_TOKEN_RATIO = 0.7
+
+
+def core_tokens(name):
+    toks = norm_name(name).split()
+    return [t for t in toks if t not in GENERIC_WORDS] or toks
+
+
 def name_similarity(a, b):
-    """0-100. token_set_ratio treats 'Shadowfax Technologies Pvt Ltd' and 'Shadowfax' as the same name."""
-    a, b = norm_name(a), norm_name(b)
-    if not a or not b:
+    """0-100. Legal suffixes and descriptor words are ignored ('Shadowfax Technologies Pvt Ltd' ==
+    'Shadowfax'). token_set_ratio alone scores any subset as 100, so 'Grain' vs 'Grain Garden
+    Delight' would look identical: when the shorter name has under 70% of the longer one's
+    distinctive tokens, the score falls back to plain whole-string similarity."""
+    na, nb = norm_name(a), norm_name(b)
+    if not na or not nb:
         return 0
-    return fuzz.token_set_ratio(a, b)
+    tsr = fuzz.token_set_ratio(na, nb)
+    ca, cb = core_tokens(a), core_tokens(b)
+    short, long_ = sorted((len(set(ca)), len(set(cb))))
+    if long_ and short / long_ < MIN_TOKEN_RATIO:
+        return min(tsr, fuzz.ratio(" ".join(ca), " ".join(cb)))
+    return tsr
 
 
 def normalize_url(website):
@@ -48,6 +70,52 @@ def domain_of(website):
 
 def domain_similarity(a, b):
     return fuzz.ratio(a or "", b or "")
+
+
+def classify_doh(answer):
+    """A DNS-over-HTTPS JSON answer -> 'exists' | 'nxdomain' | 'error'.
+    RCODE 0 = the name exists (even with no A record), 3 = NXDOMAIN (definitively no such domain),
+    anything else (SERVFAIL, REFUSED, ...) says nothing about the domain."""
+    status = (answer or {}).get("Status")
+    return {0: "exists", 3: "nxdomain"}.get(status, "error")
+
+
+_SECOND_LEVEL = {"co", "com", "net", "org", "gov", "ac", "edu", "firm", "gen", "ind"}
+_CONFUSABLE = str.maketrans({"0": "o", "1": "l", "i": "l", "|": "l", "5": "s", "3": "e"})
+
+
+def domain_label(domain):
+    """'shadowfax.in' -> 'shadowfax', 'acme.co.in' -> 'acme' (the part a typosquatter imitates)."""
+    parts = (domain or "").lower().split(".")
+    if len(parts) >= 3 and parts[-2] in _SECOND_LEVEL:
+        parts = parts[:-2]
+    elif len(parts) >= 2:
+        parts = parts[:-1]
+    return parts[-1] if parts else ""
+
+
+def is_lookalike(domain, real_domains, min_sim=80):
+    """A near-copy of a real company's domain: the name part is a typo or a confusable-character
+    swap of the real one ('retooi.com' vs 'retool.com', 'shadowfaax.in' vs 'shadowfax.in').
+    The same name on another TLD ('shadowfax.co') is NOT a lookalike: companies own several.
+    Returns (is_lookalike, closest_real_domain, similarity)."""
+    d, lab = (domain or "").lower(), domain_label(domain)
+    best = (False, None, 0)
+    for real in real_domains or []:
+        r = (real or "").lower()
+        if not r:
+            continue
+        if r == d:
+            return False, r, 100
+        rl = domain_label(r)
+        if not lab or not rl or lab == rl:
+            continue
+        sim = fuzz.ratio(lab, rl)
+        if lab.translate(_CONFUSABLE) == rl.translate(_CONFUSABLE):
+            sim = max(sim, 99)
+        if sim >= min_sim and sim > best[2]:
+            best = (True, r, sim)
+    return best
 
 
 # ---------- HTML ----------
@@ -319,6 +387,97 @@ def copy_search_phrases(title, snippet, max_words=12):
     sent = re.sub(r"^[A-Z][a-z]{2,8} \d{1,2},? \d{4}\s*[—-]\s*", "", sent)
     second = " ".join(sent.split()[:max_words])
     return [p for i, p in enumerate([first, second]) if len(p.split()) >= 4 and p not in [first, second][:i]]
+
+
+# ---------- company-level adverse media ----------
+COMPANY_RISK_TERMS = ADVERSE_TERMS + [r"booked", r"raid\w*", r"fake (?:firm|company)", r"front company",
+                                      r"dummy (?:firm|company|directors?)", r"hawala", r"forged"]
+IMPERSONATION = re.compile(
+    r"\b(pos(?:ing|ed|es)? as|impersonat\w*|in the name of|pretend\w* to be|"
+    r"(?:using|misusing|misused|used) (?:its|their|the company'?s?|the) (?:name|brand|logo)|"
+    r"fake (?:\w+ ){0,2}(?:agents?|executives?|employees?|staff|websites?|sites?|apps?|jobs?|offers?|"
+    r"recruit\w*|calls?|messages?|delivery\w*)|phishing|lookalike|spoof\w*|cloned)\b")
+ENTITY_CUES = re.compile(
+    r"\b(shell (?:company|companies|firm|firms|entity|entities)|front (?:company|firm)|"
+    r"dummy (?:company|firm|directors?)|fake (?:company|firm)|bogus (?:company|firm)|"
+    r"(?:floated|set up|created|incorporated|used)\b(?:\W+\w+){0,8}?\W+(?:to|for)\W+(?:\w+\W+){0,4}?"
+    r"(?:route|routing|launder\w*|siphon\w*|layer\w*|conduit)|banking conduit|money[- ]launder\w*|hawala|ponzi)\b")
+LEADER_ARREST = re.compile(
+    r"\b(directors?|promoters?|managing director|founders?|co-?founders?|owners?|proprietors?|ceo|chairman)\b"
+    r"(?:\W+\w+){0,8}?\W+(arrested|apprehended|nabbed|booked|detained|charge-?sheeted)\b|"
+    r"\b(arrested|apprehended|nabbed|booked|detained)\b(?:\W+\w+){0,8}?\W+"
+    r"(directors?|promoters?|founders?|owners?|proprietors?)\b")
+
+
+def _company_patterns(company_names):
+    """One regex per distinct company name (legal suffixes dropped), matching across punctuation."""
+    pats, seen = [], set()
+    for n in company_names or []:
+        toks = norm_name(n).split()
+        key = " ".join(toks)
+        if not toks or key in seen or len(key) < 3:
+            continue
+        seen.add(key)
+        pats.append((n, re.compile(r"\b" + r"[\W_]+".join(re.escape(t) for t in toks) + r"\b", re.I)))
+    return pats
+
+
+def company_triage(text, company_names):
+    """A company hit needs reading only if its title/snippet has the company's full name AND a risk
+    keyword. Returns (needs_read, reason)."""
+    low = (text or "").lower()
+    named = next((n for n, p in _company_patterns(company_names) if p.search(text or "")), None)
+    risk = [m.group() for t in COMPANY_RISK_TERMS for m in [re.search(r"\b" + t + r"\b", low)] if m]
+    if not named:
+        return False, f"title/snippet does not contain the company's full name ({', '.join(company_names)})"
+    if not risk:
+        return False, f"names \"{named}\" but has no risk keyword"
+    return True, f"title/snippet names \"{named}\" with risk keyword(s) {risk}"
+
+
+def classify_company_hit(text, company_names, window=300):
+    """Is the page accusing THE COMPANY? Only if accusing wording sits next to its name:
+    shell/front/dummy firm, set up to route or launder money, its directors/promoters arrested,
+    an FIR/case against it, or it being booked/raided. A mention where it is impersonated,
+    the victim, or the complainant is not an accusation.
+    Returns (verdict, reason, passage): adverse | not_adverse | no_adverse_content | not_about_company."""
+    text = text or ""
+    low = text.lower()
+    mentions = []
+    for n, p in _company_patterns(company_names):
+        mentions += [(m.start(), m.end(), n, p) for m in p.finditer(text)]
+    if not mentions:
+        return "not_about_company", f"page does not name the company ({', '.join(company_names)})", None
+    best = None
+    for s, e, n, p in sorted(mentions):
+        a, b = max(0, s - window), min(len(text), e + window)
+        win = low[a:b]
+        co = p.pattern
+        directed = re.search(
+            rf"(?:fir|case|complaint|chargesheet|charges?)\s+(?:\w+\s+){{0,3}}against\s+(?:the\s+)?(?:company\s+)?{co}"
+            rf"|{co}(?:\W+\w+){{0,3}}?\W+(?:was|has been|were|is)?\s*(?:booked|charged|accused|indicted|raided)\b"
+            rf"|raid\w*\s+(?:on|at)\s+(?:the\s+)?(?:offices?\s+of\s+)?{co}", win, re.I)
+        complainant = re.search(
+            rf"{co}\s+(?:has\s+|had\s+)?(?:filed|lodged|registered)\s+(?:a\s+|an\s+)?(?:police\s+)?(?:fir|complaint|case)",
+            win, re.I)
+        imp = IMPERSONATION.search(win)
+        cue = directed or ENTITY_CUES.search(win) or LEADER_ARREST.search(win)
+        if cue and not imp and not complainant:
+            cand = (3, "adverse", f"\"{n}\" with accusing wording \"{checks_trim(cue.group())}\" next to it", s, e)
+        elif cue:
+            why = (f"impersonated (\"{imp.group()}\")" if imp else "the complainant")
+            cand = (2, "not_adverse", f"\"{n}\" is {why} here, not accused", s, e)
+        else:
+            cand = (1, "no_adverse_content", f"names \"{n}\" but no accusing wording next to it", s, e)
+        if best is None or cand[0] > best[0]:
+            best = cand
+    _, verdict, reason, s, e = best
+    return verdict, reason, passage(text, s, e, radius=260)
+
+
+def checks_trim(s, n=80):
+    s = norm_space(s)
+    return s if len(s) <= n else s[:n] + "..."
 
 
 def classify_hit(text, person, company_names, window=600):

@@ -17,8 +17,11 @@ import sys
 import time
 from datetime import datetime, timezone
 
+from urllib.parse import urlparse
+
 import checks
 import crust_client as cc
+import dnscheck
 import gdelt
 import store
 
@@ -40,15 +43,17 @@ def new_out():
     return {"data": {}, "checks": [], "red_flags": [], "evidence": [], "unavailable": []}
 
 
-def mark_unavailable(out, what, rec_or_reason):
-    """A source we could not read (outage, timeout, error status). Never treated as 'no record'."""
+def mark_unavailable(out, what, rec_or_reason, kind="source"):
+    """A source we could not read (outage, timeout, error status). Never treated as 'no record'.
+    kind='adverse_page': an adverse-media article that passed triage but couldn't be read. Such a
+    page can only add negative evidence, never clear the vendor (see step_decide)."""
     if isinstance(rec_or_reason, str):
         reason = rec_or_reason
     elif rec_or_reason.get("unavailable_reason"):
         reason = rec_or_reason["unavailable_reason"]
     else:
         reason = f"HTTP {rec_or_reason.get('status_code')}: {json.dumps(rec_or_reason.get('error'))[:200]}"
-    out["unavailable"].append({"source": what, "reason": reason})
+    out["unavailable"].append({"source": what, "reason": reason, "kind": kind})
 
 
 def ev(out, source, field, value, retrieved_at, record_date=None):
@@ -105,6 +110,8 @@ def first_list(data):
 def _matches(rec):
     if rec.get("status_code") == 404:
         return []
+    if rec.get("status_code") == 400 and "invalid company domains" in json.dumps(rec.get("error") or "").lower():
+        return []  # Crustdata rejected the domain outright: a definitive "no record", not an outage
     if rec.get("data") is None:
         return None
     out = []
@@ -145,7 +152,17 @@ def step_identify(job, name, domain):
         consistent = sim >= 85 or top["id"] in name_ids
         out["data"]["domain_company"] = {**top, "name_similarity": sim, "exact_domain": exact_domain,
                                          "in_name_search": top["id"] in name_ids}
-        if consistent:
+        # A fuzzy domain match to a company whose real domain the given one imitates is a
+        # typosquat, not that company: never adopt the company it copies.
+        look, real, lsim = (False, None, 0) if exact_domain else checks.is_lookalike(
+            domain, top["all_domains"] + [top["primary_domain"]])
+        if look:
+            out["data"]["domain_company"]["lookalike_of"] = real
+            flag(out, "lookalike_domain", "concrete",
+                 f"{domain} fuzzy-matched \"{top['name']}\", whose real domain is {real}; {domain} is a near-copy "
+                 f"of it (label similarity {lsim})")
+            check(out, "identify", "failed", "website looks like a copy of the matched company's domain")
+        elif consistent:
             company_id = top["id"]
             check(out, "identify", "verified",
                   f"{domain} resolves to \"{top['name']}\" (crustdata id {top['id']}), which matches the "
@@ -171,13 +188,17 @@ def step_identify(job, name, domain):
         if dm is not None:
             flag(out, "no_match_for_website", "warning", f"no Crustdata company for domain {domain}")
         strong = [m for m in (nm or []) if checks.name_similarity(name, m["name"]) >= 90]
-        look = next((m for m in strong if m["primary_domain"]
-                     and m["primary_domain"].lower() != domain
-                     and checks.domain_similarity(m["primary_domain"].lower(), domain) >= 80), None)
+        look = None
+        for m in strong:
+            is_look, real, lsim = checks.is_lookalike(domain, [m["primary_domain"]] + m["all_domains"])
+            if is_look:
+                look = (m, real, lsim)
+                break
         if look:
+            m, real, lsim = look
             flag(out, "lookalike_domain", "concrete",
-                 f"\"{name}\" resolves to \"{look['name']}\" at {look['primary_domain']}; the given site {domain} "
-                 f"is a near-copy of that domain (similarity {checks.domain_similarity(look['primary_domain'].lower(), domain)})")
+                 f"\"{name}\" resolves to \"{m['name']}\" at {real}; the given site {domain} is a near-copy of "
+                 f"that domain (label similarity {lsim})")
             check(out, "identify", "failed", "website looks like a copy of the named company's domain")
         elif strong:
             check(out, "identify", "unclear",
@@ -449,6 +470,27 @@ def _fetch(urls, job, human=False):
 def step_website_check(job, website, name, profile):
     out = new_out()
     url = checks.normalize_url(website)
+
+    # Does the domain exist at all? NXDOMAIN is a definitive "no record" (not an outage) and
+    # needs no fetch; a DNS timeout is "unavailable" and never read as "no such domain".
+    host = urlparse(url).netloc.split("@")[-1].split(":")[0].lower()
+    dns = dnscheck.lookup(host, job)
+    if dns["status"] == "nxdomain" and host.startswith("www."):
+        bare = dnscheck.lookup(host[4:], job)
+        if bare["status"] != "nxdomain":
+            dns = bare
+    out["data"]["dns"] = dns
+    if dns["status"] in ("exists", "nxdomain"):
+        ev(out, f"DNS-over-HTTPS {dns['resolver']} name={dns['host']} type=A", "Status (RCODE)",
+           f"{dns['rcode']} ({'NOERROR: domain exists' if dns['status'] == 'exists' else 'NXDOMAIN: no such domain'})",
+           dns["retrieved_at"])
+    if dns["status"] == "nxdomain":
+        flag(out, "website_does_not_exist", "warning",
+             f"{dns['host']} has no DNS record (NXDOMAIN): the website given does not exist")
+        check(out, "website_fetch", "failed", f"{dns['host']} does not exist (NXDOMAIN); nothing to fetch")
+        out["data"].update({"fetched": False, "nxdomain": True, "verified": False})
+        return out
+
     rec, body, items = _fetch([url], job)
     item = items[0] if items else {}
     text, links = checks.html_to_text(item.get("content") or "")
@@ -466,11 +508,14 @@ def step_website_check(job, website, name, profile):
     s = f"{item.get('url') or url} (via crustdata /web/enrich/live)"
     out["data"].update({"fetched": bool(item.get("success")), "title": title, "text_chars": len(text)})
     if not item.get("success"):
+        if dns["status"] == "unavailable":
+            mark_unavailable(out, f"DNS lookup for {host}", dns["reason"])
         mark_unavailable(out, f"vendor website {url}",
                          rec if rec.get("data") is None else "page fetch returned success=false (also tried human_mode)")
         check(out, "website_fetch", "unclear", f"could not fetch {url}; unavailable, not proof the site is missing")
         out["data"]["verified"] = False
         return out
+    # The page loaded, so the domain exists; a DNS resolver that was down changes nothing.
     ev(out, s, "title", title, at)
     low = text.lower()
 
@@ -641,7 +686,7 @@ def step_adverse_media(job, people, company_names, domain):
             else:
                 complete = False
                 mark_unavailable(out, f"adverse-media page {h['url']}",
-                                 "passed triage but could not be read (bot check or fetch failure)")
+                                 "passed triage but could not be read (bot check or fetch failure)", "adverse_page")
                 h.update({"verdict": "unreviewed", "basis": "title/snippet only",
                           "passage": checks.norm_space(f"{h['title'] or ''} — {h.get('snippet') or ''}"),
                           "reason": "passed triage (" + h["triage"] + ") but the page could not be read, or the "
@@ -650,7 +695,7 @@ def step_adverse_media(job, people, company_names, domain):
             complete = False
             h.update({"verdict": "unreviewed", "basis": "title/snippet only", "passage": h["triage"],
                       "reason": f"passed triage but over the {MAX_READ_PER_PERSON}-page reading cap; not cleared"})
-            mark_unavailable(out, f"adverse-media page {h['url']}", "over the reading cap")
+            mark_unavailable(out, f"adverse-media page {h['url']}", "over the reading cap", "adverse_page")
 
         # 4. Record every hit with its evidence.
         for h in hits:
@@ -681,6 +726,152 @@ def step_adverse_media(job, people, company_names, domain):
 
 MAX_READ_PER_PERSON = 10
 ADVERSE_QUERY_TERMS = ["fraud", "arrested", "scam", "lawsuit", '"shell company"']
+COMPANY_QUERY_TERMS = ["fraud", "arrested", "scam", '"shell company"', "cheating", "booked", '"money laundering"']
+MAX_READ_PER_COMPANY = 10
+
+
+def _query_name(name):
+    """'Grain Garden Delight Pvt Ltd' -> 'Grain Garden Delight' (articles often drop the suffix)."""
+    words = re.sub(r"[^\w\s&.-]", " ", name or "").split()
+    return " ".join(w for w in words if w.lower().strip(".") not in checks.LEGAL_SUFFIXES).strip()
+
+
+def step_company_adverse_media(job, company_names, domain):
+    """Adverse media about the company itself. Works even when Crustdata has no record of it,
+    which is how a front with no profile and no known directors gets caught with evidence.
+    A confirmed accusing article -> concrete flag 'company_adverse_media' (LOOKS_OFF)."""
+    out = new_out()
+    d = out["data"]
+    d.update({"hits": [], "sources_degraded": [], "complete": True})
+    qnames = []
+    for n in company_names:
+        q = _query_name(n)
+        if q and checks.norm_name(q) not in [checks.norm_name(x) for x in qnames]:
+            qnames.append(q)
+    if not qnames:
+        check(out, "company_adverse_media", "not_checked", "no company name to search")
+        d["complete"] = False
+        return out
+
+    # Both sources, every time: GDELT returning nothing is not proof of no coverage (it holds about
+    # three months of mostly large outlets), so Crustdata web search always runs too.
+    hits, sources = [], []
+    for qn in qnames[:2]:
+        q = f'"{qn}" (' + " OR ".join(COMPANY_QUERY_TERMS) + ")"
+        rec = gdelt.search(q, job)
+        if rec.get("data") is not None:
+            arts = (rec["data"] or {}).get("articles") or []
+            fv = f"gdelt doc api query={q!r}"
+            ev(out, fv, "count(articles)", len(arts), rec["retrieved_at"])
+            hits += [{"source": "gdelt", "url": a.get("url"), "title": a.get("title"), "snippet": None,
+                      "record_date": gdelt.seendate_iso(a.get("seendate")), "found_via": fv,
+                      "found_at": rec["retrieved_at"]} for a in arts if a.get("url")]
+            sources.append(f"GDELT ({len(arts)})")
+        else:
+            d["sources_degraded"].append({"source": "GDELT", "company": qn, "status": "source unavailable",
+                                          "reason": rec.get("unavailable_reason"),
+                                          "note": "Crustdata web search still covers this company"})
+        cq = f'"{qn}" ' + " OR ".join(COMPANY_QUERY_TERMS)
+        body = {"query": cq, "sources": ["web", "news"]}
+        crec = api("/web/search/live", body, job)
+        if crec.get("data") is None:
+            mark_unavailable(out, f"/web/search/live for company \"{qn}\" (GDELT fallback)", crec)
+            d["complete"] = False
+            continue
+        s = src("/web/search/live", body)
+        res = [r for r in ((crec["data"] or {}).get("results") or []) if r.get("url")]
+        res.sort(key=lambda r: (int(r.get("position") or 99), r["url"]))
+        ev(out, s, "count(results)", len(res), crec["retrieved_at"])
+        hits += [{"source": "crustdata_web_search", "url": r["url"], "title": r.get("title"),
+                  "snippet": r.get("snippet"), "record_date": None, "found_via": s,
+                  "found_at": crec["retrieved_at"]} for r in res]
+        sources.append(f"Crustdata web search ({len(res)})")
+
+    seen, uniq = set(), []
+    for h in hits:
+        if h["url"] not in seen and checks.domain_of(h["url"]) != domain:
+            seen.add(h["url"])
+            uniq.append(h)
+    hits = uniq
+
+    to_read = []
+    for h in hits:
+        needs, why = checks.company_triage(f"{h['title'] or ''}\n{h.get('snippet') or ''}", company_names)
+        h["triage"] = why
+        if needs:
+            # What does the title/snippet itself say? Used to read likely accusations first, and to
+            # judge a page that then can't be read.
+            sv, sr, _ = checks.classify_company_hit(f"{h['title'] or ''}\n{h.get('snippet') or ''}", company_names)
+            h.update({"snippet_verdict": sv, "snippet_reason": sr})
+            to_read.append(h)
+        else:
+            h.update({"verdict": "not_relevant", "reason": why, "basis": "title/snippet triage",
+                      "passage": checks.norm_space(f"{h['title'] or ''} — {h.get('snippet') or ''}")})
+    to_read.sort(key=lambda h: (h["snippet_verdict"] != "adverse", h["url"]))
+    overflow, to_read = to_read[MAX_READ_PER_COMPANY:], to_read[:MAX_READ_PER_COMPANY]
+
+    def judge_unread(h, why_unread):
+        """A triage-passed page we didn't read: it blocks only if its own title/snippet already
+        shows accusing wording next to the company's name."""
+        snip = checks.norm_space(f"{h['title'] or ''} — {h.get('snippet') or ''}")
+        if h["snippet_verdict"] == "adverse":
+            d["complete"] = False
+            mark_unavailable(out, f"company adverse-media page {h['url']}", why_unread, "adverse_page")
+            h.update({"verdict": "unreviewed", "basis": "title/snippet only", "passage": snip,
+                      "reason": f"{why_unread}; the snippet itself accuses the company ({h['snippet_reason']}), "
+                                "so it is not cleared"})
+        else:
+            h.update({"verdict": "not_read_no_accusation_in_snippet", "basis": "title/snippet only",
+                      "passage": snip,
+                      "reason": f"{why_unread}; its title/snippet shows no accusation of the company "
+                                f"({h['snippet_reason']}), so it does not block"})
+
+    pages = _read_pages([h["url"] for h in to_read], job, out)
+    for h in to_read:
+        it, fat = pages.get(h["url"], (None, None))
+        text = ""
+        if it and it.get("success"):
+            text, _ = checks.html_to_text(it.get("content") or "")
+            if checks.is_interstitial(it.get("title"), text):
+                text = ""
+        full = ((it or {}).get("title") or "") + "\n" + text
+        if text and not any(p.search(full) for _, p in checks._company_patterns(company_names)):
+            text = ""  # the page we got doesn't show the company the search saw: not actually read
+        if text:
+            verdict, reason, psg = checks.classify_company_hit(full, company_names)
+            h.update({"verdict": verdict, "reason": reason, "basis": "page", "passage": psg,
+                      "page_title": it.get("title"), "read_at": fat})
+        else:
+            judge_unread(h, "passed triage but the page could not be read (bot check, login wall or fetch failure)")
+    for h in overflow:
+        judge_unread(h, f"passed triage but over the {MAX_READ_PER_COMPANY}-page reading cap")
+    unread_ok = [h for h in to_read + overflow if h.get("verdict") == "not_read_no_accusation_in_snippet"]
+    if unread_ok:
+        flag(out, "company_pages_not_read", "note",
+             f"{len(unread_ok)} page(s) about the company passed triage but were not read; none of their "
+             "titles/snippets accuses the company, so they don't block. URLs: "
+             + " ".join(h["url"] for h in unread_ok))
+
+    for h in hits:
+        d["hits"].append({k: h.get(k) for k in ("source", "url", "title", "page_title", "record_date",
+                                               "verdict", "reason", "basis", "passage")})
+        if h.get("passage"):
+            where = (f"{h['url']} (page title: {h.get('page_title')!r}, via crustdata /web/enrich/live)"
+                     if h["basis"] == "page" else h["found_via"])
+            ev(out, where, "passage" if h["basis"] == "page" else "title/snippet",
+               h["passage"], h.get("read_at") or h["found_at"], h.get("record_date"))
+        if h["verdict"] == "adverse":
+            flag(out, "company_adverse_media", "concrete",
+                 f"article accuses the company itself: {h['url']} (\"{h.get('page_title') or h['title']}\") — {h['reason']}")
+    counts = {}
+    for h in hits:
+        counts[h["verdict"]] = counts.get(h["verdict"], 0) + 1
+    status = ("failed" if counts.get("adverse") else "unclear" if counts.get("unreviewed") or not d["complete"]
+              else "verified")
+    check(out, "company_adverse_media", status,
+          f"{len(hits)} hits via {', '.join(sources) or 'no source'}: "
+          + (", ".join(f"{n} {v}" for v, n in sorted(counts.items())) or "none"))
+    return out
 
 
 def _adverse_hits_gdelt(job, name, company_names, out):
@@ -944,7 +1135,8 @@ def step_entity_resolution(outs, name, domain):
     # city: HQ city on the profile vs the address on the site / the leaders' cities
     hq_city = (prof.get("hq") or "").split(",")[0].strip()
     lead_cities = [p.get("city") for p in people if p.get("city")]
-    city_hits = [c for c in lead_cities if hq_city and checks.name_similarity(c, hq_city) >= 85]
+    city_hits = [c for c in lead_cities if hq_city and checks.core_city(c) and
+                 checks.core_city(c) == checks.core_city(hq_city)]
     if web["data"].get("address_matches_hq"):
         sig("city", "agree", f"the website lists the profile's HQ ({prof.get('hq')})")
     elif city_hits:
@@ -978,9 +1170,9 @@ def step_entity_resolution(outs, name, domain):
 
 # ---------- step: decide ----------
 def step_decide(outs):
-    ident, prof, ppl, web, ops, er, adv = (outs[k] for k in (
+    ident, prof, ppl, web, ops, er, adv, cadv = (outs[k] for k in (
         "identify", "company_profile", "who_runs_it", "website_check", "operating_signals",
-        "entity_resolution", "adverse_media"))
+        "entity_resolution", "adverse_media", "company_adverse_media"))
     flags = [f for o in outs.values() for f in o["red_flags"]]
     concrete = [f for f in flags if f["severity"] == "concrete"]
     unavailable = [u for o in outs.values() for u in o.get("unavailable", [])]
@@ -994,6 +1186,9 @@ def step_decide(outs):
         "adverse_media_clear": bool(adv["data"].get("complete")) and adv["data"].get("leaders_screened", 0) >= 1
                                and not any(h["verdict"] in ("adverse", "possible_adverse", "unreviewed")
                                            for h in adv["data"].get("hits", [])),
+        "company_adverse_clear": bool(cadv["data"].get("complete"))
+                                 and not any(h["verdict"] in ("adverse", "unreviewed")
+                                             for h in cadv["data"].get("hits", [])),
     }
     why = {
         "identify": "could not tie the website to the named company",
@@ -1005,11 +1200,20 @@ def step_decide(outs):
                              "active status alone does not prove trading",
         "adverse_media_clear": "adverse media not cleared (a hit that passed triage needs human review or "
                                "couldn't be read, or no leader could be screened)",
+        "company_adverse_clear": "company-level adverse media not cleared (an article accuses the company, "
+                                 "or a hit that passed triage couldn't be read)",
     }
     missing = [f"source unavailable: {u['source']} ({u['reason']})" for u in unavailable]
     missing += [why[k] for k, v in ok.items() if not v]
+    # Unread adverse-media pages can only add negative evidence; they can't clear a vendor. So they
+    # never stop a LOOKS_OFF that a page we DID read already confirms. Any other unavailable source
+    # (identity, profile, website, DNS, search) could exonerate, so it still forces CANNOT_VERIFY.
+    blocking = [u for u in unavailable if u.get("kind") != "adverse_page"]
+    confirmed = [f for f in concrete if f["flag"] in ("company_adverse_media", "director_adverse_media",
+                                                       "lookalike_domain", "parked_domain",
+                                                       "default_server_page")]
     # Order matters, most cautious first:
-    if unavailable:
+    if blocking or (unavailable and not confirmed):
         verdict, basis = "CANNOT_VERIFY", "a source was unavailable; unavailable is never treated as negative"
     elif er["data"].get("status") == "conflict":
         verdict, basis = "CANNOT_VERIFY", "entity signals conflict, so no company is picked"
@@ -1095,6 +1299,7 @@ def main():
         run("entity_resolution", lambda: step_entity_resolution(outs, name, domain))
         cnames = [n for n in {name, prof["data"].get("name")} if n]
         run("adverse_media", lambda: step_adverse_media(job, ppl["data"]["people"], cnames, domain))
+        run("company_adverse_media", lambda: step_company_adverse_media(job, cnames, domain))
         dec = run("decide", lambda: step_decide(outs))
         verdict = dec["data"]["verdict"]
 
@@ -1143,8 +1348,14 @@ def main():
         "checks": [c for o in outs.values() for c in o.get("checks", [])],
         "red_flags": [f for o in outs.values() for f in o.get("red_flags", [])],
         "adverse_media": outs.get("adverse_media", {}).get("data", {}).get("hits", []),
+        "company_adverse_media": outs.get("company_adverse_media", {}).get("data", {}).get("hits", []),
         "unavailable_sources": unavailable,
-        "sources_degraded": outs.get("adverse_media", {}).get("data", {}).get("sources_degraded", []),
+        # Every source that was slow or down: GDELT fallbacks, plus each unavailable source
+        # (Crustdata timeouts/outages and unreadable pages), so "down" is never mistaken for "clean".
+        "sources_degraded": outs.get("adverse_media", {}).get("data", {}).get("sources_degraded", [])
+                            + outs.get("company_adverse_media", {}).get("data", {}).get("sources_degraded", [])
+                            + [{"source": u["source"], "status": "source unavailable", "reason": u["reason"]}
+                               for u in unavailable],
         "retries": store.get_retries(job),
         "evidence": evidence,
         "approval": {"action": ACTION, "status": store.approval_status(job, ACTION),
@@ -1155,6 +1366,7 @@ def main():
         "steps_completed": list(outs.keys()),
         "stopped": stopped,
         "cost_credits": round(store.job_cost(job), 2),
+        "run_cost_credits": round(cc.RUN_SPENT.get(job, 0), 2),
         "runtime_seconds": round(time.time() - t0, 1),
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
