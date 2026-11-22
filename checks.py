@@ -264,6 +264,63 @@ def role_terms_for(title):
     return [r for r in ROLE_TERMS if re.search(r"\b" + re.escape(r) + r"\b", t)]
 
 
+MENTIONED_CUES = re.compile(
+    r"\b(plaintiffs?|petitioners?|applicants?|victims?|witness(?:es)?|complainants?|whistle-?blowers?|"
+    r"informants?|beneficiar(?:y|ies)|on behalf of|filed by|denied (?:an? )?(?:h-?1b |work |employment )?visa to|"
+    r"visa (?:application|petition) (?:for|of)|duped|cheated of)\b")
+ACCUSED_CUES = re.compile(
+    r"\b(accused|arrested|charged|convicted|indicted|defendants?|absconding|booked|detained|"
+    r"named in (?:the |an )?fir|chargesheet(?:ed)?|pleaded guilty|found guilty|sentenced|"
+    r"(?:allegedly|who) (?:cheated|defrauded|duped|embezzled|siphoned))\b")
+
+
+def party_role(low, s, e, window=300):
+    """Which side of a case the text puts the person on, judged near the mention.
+    Returns (mentioned_cue or None, accused_cue or None)."""
+    win = low[max(0, s - window): e + window]
+    m, a = MENTIONED_CUES.search(win), ACCUSED_CUES.search(win)
+    label = None
+    if m:
+        cue = m.group()
+        label = ("visa applicant" if "visa" in cue else "party the case was filed for" if cue in ("on behalf of", "filed by")
+                 else "victim" if cue in ("duped", "cheated of") else re.sub(r"(es|s)$", "", cue))
+    return (label, a.group() if a else None)
+
+
+SOCIAL_DOMAINS = ("facebook.com", "instagram.com", "linkedin.com", "x.com", "twitter.com", "threads.net")
+SOCIAL_TITLE = re.compile(r"(\|\s*facebook|^facebook$|instagram|\|\s*linkedin|^linkedin|\bon x\b|[|/]\s*x\s*$|"
+                          r"^x$|twitter)", re.I)
+
+
+def is_social(url, *titles):
+    """A Facebook / Instagram / LinkedIn / X page (by domain, or by title when the link is a redirect)."""
+    host = domain_of(url or "")
+    if any(host == d or host.endswith("." + d) for d in SOCIAL_DOMAINS):
+        return True
+    return any(t and SOCIAL_TITLE.search(t.strip()) for t in titles)
+
+
+def key_phrase(title, snippet, max_words=12):
+    """The headline (or the snippet's first sentence when the headline is generic) to look for elsewhere."""
+    t = re.sub(r"\s*(\.\.\.|…)\s*$", "", norm_space(title or ""))
+    t = re.split(r"\s+[|–-]\s+(?=[^|–-]*$)", t)[0]            # drop a trailing " | Site name"
+    if len(t.split()) < 4 or SOCIAL_TITLE.search(t):
+        sent = re.split(r"(?<=[.!?])\s|\.\.\.|…", norm_space(snippet or ""))[0]
+        sent = re.sub(r"^[A-Z][a-z]{2,8} \d{1,2},? \d{4}\s*[—-]\s*", "", sent)  # leading "Feb 13, 2017 — "
+        t = sent if len(sent.split()) >= 4 else t
+    return " ".join(t.split()[:max_words])
+
+
+def copy_search_phrases(title, snippet, max_words=12):
+    """Phrases to look for a readable copy of a login-walled story: the headline first, then the
+    snippet's first sentence (a social post's headline and snippet are sometimes different stories)."""
+    first = key_phrase(title, snippet, max_words)
+    sent = re.split(r"(?<=[.!?])\s|\.\.\.|…", norm_space(snippet or ""))[0]
+    sent = re.sub(r"^[A-Z][a-z]{2,8} \d{1,2},? \d{4}\s*[—-]\s*", "", sent)
+    second = " ".join(sent.split()[:max_words])
+    return [p for i, p in enumerate([first, second]) if len(p.split()) >= 4 and p not in [first, second][:i]]
+
+
 def classify_hit(text, person, company_names, window=600):
     """Spec rule: adverse only if the page mentions the person AND (the company OR their role/city).
 
@@ -274,13 +331,15 @@ def classify_hit(text, person, company_names, window=600):
       possible_adverse   person + role/city only + adverse term          (a same-city namesake fits this
                          too, so it blocks a clean verdict but is not proof on its own)
       no_adverse_content person + context, but no adverse term near the name
+      mentioned_not_adverse  adverse term near the name, but the person is plaintiff / applicant /
+                         victim / witness there and nothing near the name accuses them
       namesake_cleared   no mention, or a mention with none of company/role/city
     Returns (verdict, reason, passage_text).
     """
     name = person["name"]
     hits = name_positions(text, name)
     if not hits:
-        return "namesake_cleared", f"page does not mention \"{name}\"", None
+        return "namesake_cleared", f"text does not mention \"{name}\"", None
 
     low = text.lower()
     company_hit = None
@@ -308,12 +367,18 @@ def classify_hit(text, person, company_names, window=600):
             ctx.append(f"role \"{near_role}\"")
         if near_city:
             ctx.append(f"city \"{near_city}\"")
-        cand = (bool(ctx), bool(adverse), ctx, adverse, s, e)
+        side = party_role(low, s, e)
+        cand = (bool(ctx), bool(adverse), ctx, adverse, s, e, side)
         if best is None or cand[:2] > best[:2]:
             best = cand
 
-    has_ctx, has_adv, ctx, adverse, s, e = best
+    has_ctx, has_adv, ctx, adverse, s, e, side = best
     snippet = passage(text, s, e)
+    if has_adv and side[0] and not side[1]:
+        # Named in the case, but on the other side of it: being in a lawsuit isn't wrongdoing.
+        return ("mentioned_not_adverse",
+                f"\"{name}\" appears as {side[0]} (\"{', '.join(adverse)}\" refers to the case, not to "
+                f"wrongdoing by them); no accusation term near the name", snippet)
     if not has_ctx:
         why = [f"company ({', '.join(company_names)})"]
         why.append(f"role ({person.get('title') or 'unknown'})")

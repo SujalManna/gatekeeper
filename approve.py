@@ -17,6 +17,11 @@ ACTION = "mark_vendor_cleared"
 
 
 def main():
+    for s_ in (sys.stdout, sys.stderr):
+        try:
+            s_.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
     ap = argparse.ArgumentParser()
     ap.add_argument("job_id")
     ap.add_argument("--reject", action="store_true")

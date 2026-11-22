@@ -593,7 +593,7 @@ def step_adverse_media(job, people, company_names, domain):
                 gdelt_down = True
             else:
                 out["data"]["sources_degraded"].append(
-                    {"source": "GDELT", "person": name, "reason": "skipped: GDELT already failed earlier in this run"})
+                    {"source": "GDELT", "person": name, "status": "source unavailable", "reason": "skipped: GDELT already failed earlier in this run"})
             hits, source = _adverse_hits_crustdata(job, name, out)
         if hits is None:
             complete = False
@@ -635,6 +635,9 @@ def step_adverse_media(job, people, company_names, domain):
                                                            company_names)
                 h.update({"verdict": verdict, "reason": reason, "basis": "page", "passage": psg,
                           "page_title": it.get("title"), "read_at": fat})
+            elif checks.is_social(h["url"], (it or {}).get("title"), h["title"]):
+                if not _judge_social_wall(job, h, person, company_names, out):
+                    complete = False
             else:
                 complete = False
                 mark_unavailable(out, f"adverse-media page {h['url']}",
@@ -654,9 +657,9 @@ def step_adverse_media(job, people, company_names, domain):
             out["data"]["hits"].append({k: h.get(k) for k in ("person", "source", "url", "title", "record_date",
                                                                "verdict", "reason", "basis", "passage")})
             if h.get("passage"):
-                where = (f"{h['url']} (via crustdata /web/enrich/live)" if h["basis"] == "page"
-                         else h["found_via"])
-                ev(out, where, "passage" if h["basis"] == "page" else "title/snippet",
+                where = h.get("evidence_source") or (
+                    f"{h['url']} (via crustdata /web/enrich/live)" if h["basis"] == "page" else h["found_via"])
+                ev(out, where, "passage" if h["basis"] in ("page", "readable copy") else "title/snippet",
                    h["passage"], h.get("read_at") or h["found_at"], h.get("record_date"))
             if h["verdict"] == "adverse":
                 flag(out, "director_adverse_media", "concrete", f"{name}: {h['url']} — {h['reason']}")
@@ -688,8 +691,9 @@ def _adverse_hits_gdelt(job, name, company_names, out):
     rec = gdelt.search(q, job)
     if rec.get("data") is None:
         out["data"]["sources_degraded"].append(
-            {"source": "GDELT", "person": name, "reason": rec.get("unavailable_reason"),
-             "note": "fell back to Crustdata web search"})
+            {"source": "GDELT", "person": name, "status": "source unavailable",
+             "reason": rec.get("unavailable_reason"),
+             "note": "fell back to Crustdata web search; the check was completed there"})
         return None, None
     arts = (rec["data"] or {}).get("articles") or []
     found_via = f"gdelt doc api query={q!r}"
@@ -697,6 +701,61 @@ def _adverse_hits_gdelt(job, name, company_names, out):
     return [{"source": "gdelt", "url": a.get("url"), "title": a.get("title"), "snippet": None,
              "record_date": gdelt.seendate_iso(a.get("seendate")), "found_via": found_via,
              "found_at": rec["retrieved_at"]} for a in arts if a.get("url")], "GDELT"
+
+
+def _judge_social_wall(job, h, person, company_names, out):
+    """A Facebook / Instagram / LinkedIn / X hit we can't read past the login wall.
+
+    1. Search the headline (or the snippet's key phrase) for a readable copy of the same story,
+       and judge from the first copy that names the person.
+    2. If there is none, judge from the snippet with the same rule; a namesake result there is
+       'namesake_unconfirmed', which doesn't block but is listed as a note with snippet and URL.
+    Returns False only when the copy search itself was unavailable (then the hit stays unreviewed).
+    """
+    name = person["name"]
+    phrases = checks.copy_search_phrases(h["title"], h.get("snippet"))
+    phrase = " / ".join(phrases) or "(no usable phrase)"
+    for ph in phrases:
+        body = {"query": f"\"{ph}\"", "sources": ["news", "web"]}
+        rec = api("/web/search/live", body, job)
+        if rec.get("data") is None:
+            mark_unavailable(out, f"/web/search/live for a readable copy of {h['url']}", rec)
+            h.update({"verdict": "unreviewed", "basis": "title/snippet only",
+                      "passage": checks.norm_space(f"{h['title'] or ''} — {h.get('snippet') or ''}"),
+                      "reason": "social-media login wall, and the search for a readable copy was unavailable"})
+            return False
+        s = src("/web/search/live", body)
+        res = [r for r in ((rec["data"] or {}).get("results") or [])
+               if r.get("url") and not checks.is_social(r["url"], r.get("title"))]
+        res.sort(key=lambda r: (int(r.get("position") or 99), r["url"]))
+        ev(out, s, f"count(non-social results) for \"{ph}\" (copy of {h['url']})", len(res), rec["retrieved_at"])
+        cand = res[:3]
+        pages = _read_pages([r["url"] for r in cand], job, out)
+        for r in cand:
+            it, fat = pages.get(r["url"], (None, None))
+            if not (it and it.get("success")):
+                continue
+            text, _ = checks.html_to_text(it.get("content") or "")
+            full = (it.get("title") or "") + "\n" + text
+            if checks.is_interstitial(it.get("title"), text) or not checks.name_positions(full, name):
+                continue
+            verdict, reason, psg = checks.classify_hit(full, person, company_names)
+            h.update({"verdict": verdict, "basis": "readable copy", "passage": psg, "read_at": fat,
+                      "reason": f"login wall; judged from a readable copy of the story at {r['url']}: {reason}",
+                      "evidence_source": f"{r['url']} (readable copy of {h['url']}, via crustdata /web/enrich/live)"})
+            return True
+
+    snip = checks.norm_space(f"{h['title'] or ''} — {h.get('snippet') or ''}")
+    verdict, reason, psg = checks.classify_hit(f"{h['title'] or ''}\n{h.get('snippet') or ''}", person,
+                                               company_names)
+    if verdict == "namesake_cleared":
+        verdict = "namesake_unconfirmed"
+        flag(out, "namesake_unconfirmed", "note",
+             f"{name}: login-wall page with no readable copy (searched \"{phrase}\"); not counted against the "
+             f"vendor because the snippet names no company, role or city. URL: {h['url']} Snippet: \"{snip}\"")
+    h.update({"verdict": verdict, "basis": "snippet (login wall, no readable copy)", "passage": snip,
+              "reason": f"login wall, no readable copy found (searched \"{phrase}\"); judged from the snippet: {reason}"})
+    return True
 
 
 def _adverse_hits_crustdata(job, name, out):
@@ -987,7 +1046,18 @@ def build_summary(outs, verdict, missing):
             "anything_off": off}
 
 
+def utf8_console():
+    """Windows consoles and redirected output default to a legacy code page that can't print
+    names like 'Karnātaka'; never let printing the result crash the run."""
+    for s in (sys.stdout, sys.stderr):
+        try:
+            s.reconfigure(encoding="utf-8", errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 def main():
+    utf8_console()
     ap = argparse.ArgumentParser()
     ap.add_argument("--name", required=True)
     ap.add_argument("--website", required=True)
