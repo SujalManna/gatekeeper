@@ -62,8 +62,8 @@ flowchart TD
     RETRY -.->|response| LEDGER
     LEDGER -.-> CACHE
 
-    classDef store fill:#eef,stroke:#557;
-    classDef gate fill:#ffe9c7,stroke:#b77a00;
+    classDef store fill:#e8ecff,stroke:#557,color:#111;
+    classDef gate fill:#ffe9c7,stroke:#b77a00,color:#111;
     class JOB,CACHE,LEDGER store;
     class GATE,HUMAN gate;
 ```
