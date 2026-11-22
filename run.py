@@ -462,7 +462,7 @@ def _fetch(urls, job, human=False):
     body = {"urls": urls}
     if human:
         body["human_mode"] = True
-        if not os.path.exists(cc._cache_path("/web/enrich/live", body)):  # cached answers are free and fast
+        if not cc.cache_exists(cc._cache_path("/web/enrich/live", body)):  # cached answers are free and fast
             with _HUMAN_LOCK:
                 allowed = max(0, MAX_HUMAN_MODE_PER_RUN - _HUMAN["used"])
                 take = urls[:allowed]
@@ -482,10 +482,7 @@ def _fetch(urls, job, human=False):
     if rec.get("data") is not None and (len(items) < len(urls) or any(unread(i) for i in items)):
         # A page that failed to load or hit a bot check is "unavailable", not "empty":
         # drop it from the cache so a re-run retries.
-        try:
-            os.remove(cc._cache_path("/web/enrich/live", body))
-        except OSError:
-            pass
+        cc.cache_drop(cc._cache_path("/web/enrich/live", body))
     return rec, body, items
 
 
@@ -1453,10 +1450,12 @@ def main():
         "generated_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
     }
     store.finish_job(job, {"verdict": verdict}, status="done" if not stopped else "stopped")
-    os.makedirs("output", exist_ok=True)
-    path = os.path.join("output", f"{job}.json")
+    out_dir = os.path.join(store.DATA_DIR, "output")
+    os.makedirs(out_dir, exist_ok=True)
+    path = os.path.join(out_dir, f"{job}.json")
     with open(path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
+    store.save_result(job, result)  # the API reads results from the store (any server instance)
     print(json.dumps(result, indent=2, ensure_ascii=False))
     print(f"\nverdict: {verdict}   saved: {path}")
     return 0 if not stopped else 2

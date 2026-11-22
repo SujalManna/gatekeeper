@@ -19,7 +19,7 @@ import store
 
 URL = "https://api.gdeltproject.org/api/v2/doc/doc"
 ENDPOINT = "gdelt /api/v2/doc/doc"
-CACHE_DIR = "cache"
+CACHE_DIR = os.path.join(store.DATA_DIR, "cache")
 LAST_CALL = os.path.join(CACHE_DIR, ".gdelt_last_call")
 MIN_GAP = 5.5        # GDELT: "Please limit requests to one every 5 seconds"
 ATTEMPTS = 1         # a slow GDELT must not eat the run's time budget; Crustdata search is the fallback
@@ -33,6 +33,26 @@ _LOCK = threading.Lock()  # steps search in parallel; GDELT's one-request-per-5s
 def _cache_path(params):
     h = hashlib.sha256(json.dumps(params, sort_keys=True).encode()).hexdigest()[:20]
     return os.path.join(CACHE_DIR, f"gdelt_doc_{h}.json")
+
+
+def _cache_load(path):
+    """Files locally; the database when deployed (functions keep no files between requests)."""
+    if store.USE_POSTGRES:
+        return store.cache_get(os.path.basename(path))
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    return None
+
+
+def _cache_save(path, rec):
+    if store.USE_POSTGRES:
+        store.cache_put(os.path.basename(path), rec)
+        return
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(rec, f, indent=2)
+    os.replace(tmp, path)
 
 
 def _throttle():
@@ -76,9 +96,8 @@ def _mark_down(reason):
 def search(query, job_id, maxrecords=25):
     params = {"query": query, "mode": "artlist", "format": "json", "maxrecords": maxrecords}
     path = _cache_path(params)
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
-            rec = json.load(f)
+    rec = _cache_load(path)
+    if rec is not None:
         store.log_cost(job_id, ENDPOINT, 0, True, 200)
         rec["cached"] = True
         return rec
@@ -109,10 +128,7 @@ def _search_live(params, path, job_id):
                     rec = {"data": data, "error": None, "status_code": 200, "endpoint": ENDPOINT,
                            "request": params, "url": r.url,
                            "retrieved_at": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-                    tmp = path + ".tmp"
-                    with open(tmp, "w", encoding="utf-8") as f:
-                        json.dump(rec, f, indent=2)
-                    os.replace(tmp, path)
+                    _cache_save(path, rec)
                     rec["cached"] = False
                     return rec
             else:

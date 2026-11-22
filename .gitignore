@@ -16,3 +16,8 @@ __pycache__/
 *.pyc
 *.log
 *.tmp
+
+# frontend build / deploy
+node_modules/
+web/dist/
+.vercel/

@@ -1,5 +1,11 @@
 {
   "cost_limit_credits_per_run": 60,
+  "pricing": {
+    "usd_per_credit": 0.30,
+    "usd_per_credit_note": "15,000 credits = $4,500",
+    "inr_per_usd": 92.66,
+    "inr_per_usd_note": "x-rates.com, 22 Nov 2026 08:53 UTC"
+  },
   "time_limit_seconds_per_run": 180,
   "api_version": "2025-11-01",
   "base_url": "https://api.crustdata.com",

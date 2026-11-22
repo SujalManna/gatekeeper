@@ -17,10 +17,11 @@ from dotenv import load_dotenv
 import store
 
 load_dotenv()
-with open("config.json", encoding="utf-8") as _f:
+HERE = os.path.dirname(os.path.abspath(__file__))
+with open(os.path.join(HERE, "config.json"), encoding="utf-8") as _f:
     CFG = json.load(_f)
 KEY = os.getenv("CRUSTDATA_API_KEY")
-CACHE_DIR = "cache"
+CACHE_DIR = os.path.join(store.DATA_DIR, "cache")
 os.makedirs(CACHE_DIR, exist_ok=True)
 
 
@@ -62,12 +63,42 @@ def _write_atomic(path, obj):
     os.replace(tmp, path)  # a kill mid-write leaves only the .tmp, never a half-written cache file
 
 
+# The cache lives in files locally and in the database when deployed (functions keep no files).
+def cache_load(path):
+    if store.USE_POSTGRES:
+        return store.cache_get(os.path.basename(path))
+    if os.path.exists(path):
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    return None
+
+
+def cache_save(path, rec):
+    if store.USE_POSTGRES:
+        store.cache_put(os.path.basename(path), rec)
+    else:
+        _write_atomic(path, rec)
+
+
+def cache_exists(path):
+    return store.cache_has(os.path.basename(path)) if store.USE_POSTGRES else os.path.exists(path)
+
+
+def cache_drop(path):
+    if store.USE_POSTGRES:
+        store.cache_delete(os.path.basename(path))
+    else:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
 def call(endpoint, body, job_id="adhoc", method="POST"):
     """Returns {"data": <json>, "retrieved_at": iso, "endpoint": str, "cached": bool}."""
     path = _cache_path(endpoint, body)
-    if os.path.exists(path):
-        with open(path, encoding="utf-8") as f:
-            rec = json.load(f)
+    rec = cache_load(path)
+    if rec is not None:
         store.log_cost(job_id, endpoint, 0, True, 200)
         rec["cached"] = True
         return rec
@@ -142,7 +173,7 @@ def call(endpoint, body, job_id="adhoc", method="POST"):
            "request": body, "retrieved_at": retrieved_at,
            "credits": credits, "credits_source": credits_source}
     if ok:
-        _write_atomic(path, rec)
+        cache_save(path, rec)
     rec["cached"] = False
     return rec
 

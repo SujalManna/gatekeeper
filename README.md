@@ -103,11 +103,54 @@ CRUSTDATA_API_KEY=...
 | `python run.py --name "<vendor>" --website "<url>"` | Check a vendor. Running it again **resumes**: finished steps are skipped, API calls come from the cache. |
 | `python run.py ... --recheck` | Re-run every step from cached responses (no re-spend); approvals are kept. |
 | `python approve.py <job_id>` / `--reject` | The only way to mark a vendor cleared. Refuses unless a request is pending and the saved verdict is REAL_AND_TRADING. |
-| `streamlit run app.py` | Web UI: name + website → verdict banner, who runs it, age, red flags, adverse media, evidence with links, cost (credits and ₹), runtime, and an Approve button (REAL_AND_TRADING only; runs `approve.py`). |
 | `python run_tests.py` | Unit + mocked-outage tests: offline, no credits. |
 | `python run_tests.py --e2e [--recheck] [-k text]` | Also the live end-to-end vendor cases, each with its runtime and credits. |
 
 Limits live in `config.json`: `cost_limit_credits_per_run` (60) and `time_limit_seconds_per_run` (180).
+`approve.py` also takes `--by "<name>"` to record who decided (default: your OS user name).
+
+## Web app and deployment
+
+The web app is a **FastAPI** backend (`server.py`) and a **React + TypeScript** frontend (`web/`, built
+with Vite). Both deploy to **Vercel** as one project with two services (`vercel.json`): `/api/*` goes
+to the API, and everything else goes to the frontend.
+
+| API | What it does |
+|---|---|
+| `POST /api/checks` | Runs a check (`run.py` in its own process) and streams progress as NDJSON, then the result |
+| `GET /api/checks`, `GET /api/checks/{job_id}` | Recent checks; one full result |
+| `POST /api/checks/{job_id}/approval` | Approve or reject, with the approver's name. Calls the same `approve.decide()` as the CLI |
+| `GET /api/config`, `GET /api/health` | Pricing and limits; liveness (the only unauthenticated endpoint) |
+
+Interactive API docs are at `/api/docs`.
+
+- **Access:** every endpoint except `/api/health` needs `Authorization: Bearer <APP_ACCESS_TOKEN>`. The
+  frontend asks for the token once per browser tab.
+- **Storage:** with `DATABASE_URL` set (production), the job store, steps, ledger, evidence,
+  approvals, results and API cache live in Postgres. Vercel functions keep no files between requests.
+  Without it, it's SQLite and files, as for the CLI.
+- **Time:** a check runs inside one request (the function limit is 300 s; the run deadline is 165 s).
+  If the browser disconnects, the run stops, and running it again resumes from the saved steps.
+
+**Deploying (Vercel builds everything; nothing to install locally):**
+
+1. Import the GitHub repo as a new Vercel project. Vercel detects the services from `vercel.json`.
+2. Add a Postgres database from the Vercel Marketplace (Neon). It sets `DATABASE_URL`.
+3. Set these environment variables in Vercel:
+   - `CRUSTDATA_API_KEY`
+   - `APP_ACCESS_TOKEN`: a long random string, which you then share with the people who use the app
+4. Deploy. Every push to `main` redeploys; other branches get preview URLs.
+
+**Running it locally (optional, needs Node.js and the Python packages):**
+
+```powershell
+pip install -r requirements.txt uvicorn
+$env:APP_ACCESS_TOKEN = "dev-token"; uvicorn server:app --port 8000
+```
+
+```powershell
+cd web; npm install; npm run dev
+```
 
 ## Robustness
 
@@ -237,6 +280,9 @@ Margin rises as cost falls:
 | `crust_client.py` | Crustdata client: cache, retries, deadline, ledger, budget |
 | `gdelt.py` | GDELT client: throttle, cooldown, cache |
 | `dnscheck.py` | DNS-over-HTTPS lookup |
-| `store.py` | SQLite: jobs, steps, ledger, evidence, approvals, retries |
-| `approve.py` | The human approval gate |
+| `store.py` | Job store (Postgres in production, SQLite locally): jobs, steps, ledger, evidence, approvals, retries, results, API cache |
+| `approve.py` | The human approval gate (`decide()`, shared by the CLI and the API) |
+| `server.py` | FastAPI backend |
+| `web/` | React + TypeScript frontend (Vite) |
+| `vercel.json` | Vercel services and routing |
 | `run_tests.py`, `tests/` | The test set and runner (`tests/mock_run.py` simulates outages offline) |
