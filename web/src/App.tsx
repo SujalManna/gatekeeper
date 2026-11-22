@@ -212,7 +212,6 @@ export default function App() {
                   placeholder="Shadowfax Technologies"
                   value={name}
                   required
-                  maxlength="200"
                   onInput={(e: FormEvent<HTMLElement>) => setName((e.target as HTMLInputElement).value)}
                 >
                   <md-icon slot="leading-icon">storefront</md-icon>
@@ -222,7 +221,6 @@ export default function App() {
                   placeholder="shadowfax.in"
                   value={website}
                   required
-                  maxlength="300"
                   onInput={(e: FormEvent<HTMLElement>) => setWebsite((e.target as HTMLInputElement).value)}
                 >
                   <md-icon slot="leading-icon">language</md-icon>

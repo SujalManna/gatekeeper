@@ -75,7 +75,6 @@ export default function ApprovalPanel({ result, onChange }: { result: CheckResul
           <md-outlined-text-field
             label="Your name"
             value={approver}
-            maxlength="120"
             supporting-text="Recorded with the decision"
             onInput={(e: FormEvent<HTMLElement>) => setApprover((e.target as HTMLInputElement).value)}
           ></md-outlined-text-field>
