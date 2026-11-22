@@ -1,92 +1,119 @@
-import { useState } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
 import { api } from "../api";
 import { when } from "../format";
 import type { CheckResult } from "../types";
 
 const APPROVER_KEY = "gatekeeper.approver";
 
-/** The human gate. Only a REAL_AND_TRADING check with a pending request can be approved,
- *  and every decision needs a second, explicit confirmation and records who made it. */
+/** "Your decision": the human gate. Only a REAL_AND_TRADING check with a pending request can be
+ *  approved. Each decision is confirmed in an M3 dialog and records who made it. */
 export default function ApprovalPanel({ result, onChange }: { result: CheckResult; onChange: (r: CheckResult) => void }) {
   const [approver, setApprover] = useState(() => localStorage.getItem(APPROVER_KEY) ?? "");
   const [pending, setPending] = useState<"approve" | "reject" | null>(null);
   const [busy, setBusy] = useState(false);
-  const [message, setMessage] = useState<{ ok: boolean; text: string } | null>(null);
+  const [error, setError] = useState<string | null>(null);
+  const dialog = useRef<HTMLElement>(null);
   const a = result.approval;
+  const status = a.status ?? "none";
+  const nameOk = approver.trim().length >= 2;
+
+  // The dialog can also be dismissed with Esc or the scrim: treat that as Cancel.
+  useEffect(() => {
+    const el = dialog.current;
+    if (!el) return;
+    const onClosed = () => setPending(null);
+    el.addEventListener("closed", onClosed);
+    return () => el.removeEventListener("closed", onClosed);
+  }, []);
 
   async function confirm() {
     if (!pending) return;
     setBusy(true);
-    setMessage(null);
+    setError(null);
     try {
       localStorage.setItem(APPROVER_KEY, approver.trim());
       const res = await api.decide(result.job_id, pending, approver.trim());
-      setMessage({ ok: true, text: res.message });
       if (res.result) onChange(res.result);
     } catch (err) {
-      setMessage({ ok: false, text: (err as Error).message });
+      setError((err as Error).message);
     } finally {
       setBusy(false);
       setPending(null);
     }
   }
 
-  if (result.verdict !== "REAL_AND_TRADING") {
-    return (
-      <section className="card">
-        <h2>Approval</h2>
-        <p className="muted">
-          Only vendors that are <strong>real and trading</strong> can be cleared. Status: {a.status ?? "no request"}.
-        </p>
-        {a.warning && <p className="error">{a.warning}</p>}
-      </section>
-    );
-  }
+  const tone = result.verdict === "LOOKS_OFF" ? "bad" : result.verdict === "CANNOT_VERIFY" ? "warn" : "";
+  const chip = status === "pending" ? "Awaiting approval" : status === "approved" ? "Cleared" : status === "rejected" ? "Rejected" : "Not clearable";
 
   return (
-    <section className="card approval">
-      <h2>Approval</h2>
-      {a.status === "pending" ? (
+    <aside className={`decision rise-2 ${tone}`} aria-label="Your decision">
+      <md-elevation></md-elevation>
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 10 }}>
+        <h2>{result.verdict === "REAL_AND_TRADING" ? "Your decision" : "Can't be cleared"}</h2>
+        <span className={`status-chip ${status}`}>{chip}</span>
+      </div>
+
+      {result.verdict !== "REAL_AND_TRADING" ? (
         <>
-          <p>A person must approve before this vendor is marked cleared.</p>
-          <div className="row">
-            <label className="grow">
-              Your name (recorded with the decision)
-              <input value={approver} onChange={(e) => setApprover(e.target.value)} maxLength={120} />
-            </label>
-          </div>
-          {pending ? (
-            <div className="confirm">
-              <span>
-                {pending === "approve" ? "Mark this vendor cleared" : "Reject this vendor"} as{" "}
-                <strong>{approver.trim()}</strong>?
-              </span>
-              <button className={`btn ${pending === "approve" ? "primary" : "danger"}`} onClick={confirm} disabled={busy}>
-                {busy ? "Saving…" : `Yes, ${pending}`}
-              </button>
-              <button className="btn" onClick={() => setPending(null)} disabled={busy}>
-                Cancel
-              </button>
-            </div>
+          <p>Only vendors that are real and trading can be approved.</p>
+          {result.verdict === "LOOKS_OFF" ? (
+            <ul>
+              <li>Don't onboard or pay this vendor.</li>
+              <li>Share the evidence below with compliance.</li>
+            </ul>
           ) : (
-            <div className="row">
-              <button className="btn primary" disabled={approver.trim().length < 2} onClick={() => setPending("approve")}>
-                Approve: mark vendor cleared
-              </button>
-              <button className="btn danger-outline" disabled={approver.trim().length < 2} onClick={() => setPending("reject")}>
-                Reject
-              </button>
-            </div>
+            <ul>
+              <li>See what's missing below.</li>
+              <li>Run the check again: it resumes and retries what couldn't be read.</li>
+            </ul>
           )}
+          {a.warning && <p className="error-box">{a.warning}</p>}
+        </>
+      ) : status === "pending" ? (
+        <>
+          <p>Clearing a vendor is the only irreversible step. Your name is recorded with it.</p>
+          <md-outlined-text-field
+            label="Your name"
+            value={approver}
+            maxlength="120"
+            supporting-text="Recorded with the decision"
+            onInput={(e: FormEvent<HTMLElement>) => setApprover((e.target as HTMLInputElement).value)}
+          ></md-outlined-text-field>
+          <div className="actions">
+            <md-filled-button disabled={!nameOk} onClick={() => setPending("approve")}>
+              Approve and clear
+              <md-icon slot="icon">verified</md-icon>
+            </md-filled-button>
+            <md-outlined-button disabled={!nameOk} onClick={() => setPending("reject")}>
+              Reject
+            </md-outlined-button>
+          </div>
         </>
       ) : (
-        <p className={a.status === "approved" ? "ok-text" : "muted"}>
-          Status: <strong>{a.status}</strong>
+        <p style={{ color: "var(--ink)" }}>
+          {status === "approved" ? "Cleared" : status === "rejected" ? "Rejected" : `Status: ${status}`}
           {a.decided_by ? ` by ${a.decided_by}` : ""}
-          {a.decided_at ? `, ${when(a.decided_at)}` : ""}
+          {a.decided_at ? `, ${when(a.decided_at)}` : ""}.
         </p>
       )}
-      {message && <p className={message.ok ? "ok-text" : "error"}>{message.text}</p>}
-    </section>
+      {error && <p role="alert" className="error-box">{error}</p>}
+
+      <md-dialog ref={dialog} open={pending !== null}>
+        <div slot="headline">{pending === "reject" ? "Reject this vendor?" : "Clear this vendor?"}</div>
+        <div slot="content" style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <span>
+            <strong>{result.input.name}</strong> will be marked <strong>{pending === "reject" ? "rejected" : "cleared"}</strong> by{" "}
+            <strong>{approver.trim()}</strong>.
+          </span>
+          <span className="muted small">This is recorded and can't be undone from the app.</span>
+        </div>
+        <div slot="actions">
+          <md-text-button disabled={busy} onClick={() => setPending(null)}>Cancel</md-text-button>
+          <md-filled-button disabled={busy} onClick={confirm}>
+            {busy ? "Saving…" : pending === "reject" ? "Yes, reject" : "Yes, clear"}
+          </md-filled-button>
+        </div>
+      </md-dialog>
+    </aside>
   );
 }

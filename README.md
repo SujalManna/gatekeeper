@@ -112,7 +112,9 @@ Limits live in `config.json`: `cost_limit_credits_per_run` (60) and `time_limit_
 ## Web app and deployment
 
 The web app is a **FastAPI** backend (`server.py`) and a **React + TypeScript** frontend (`web/`, built
-with Vite). Both deploy to **Vercel** as one project with two services (`vercel.json`): `/api/*` goes
+with Vite). The UI uses **Material Design 3** through Google's Material Web components (`@material/web`).
+Its color scheme is generated from the verdigris seed `#0F7B5F` with Material's color utilities. On top
+sits the app's own "Inspection Trail" look: a live, numbered trail of checks that ends in a verdict seal. Both deploy to **Vercel** as one project with two services (`vercel.json`): `/api/*` goes
 to the API, and everything else goes to the frontend.
 
 | API | What it does |
